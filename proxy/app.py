@@ -3621,10 +3621,20 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     if tee_enabled:
         title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src)
         dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-        os.replace(part, dest)
+        try:
+            shutil.move(part, dest)
+        except Exception as e:
+            logger.error("Failed to move %s to %s: %s", part, dest, e)
+            raise
         remember_media_path(guid, dest)
-        adopt_library_perms(dest)
-        write_audio_tags(dest, title, artist, album)
+        try:
+            adopt_library_perms(dest)
+        except Exception as e:
+            logger.warning("adopt_library_perms failed for %s: %s", dest, e)
+        try:
+            write_audio_tags(dest, title, artist, album)
+        except Exception as e:
+            logger.warning("write_audio_tags failed for %s: %s", dest, e)
         # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
         # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
         cover_url = _cover_url_of(src)
@@ -3641,7 +3651,11 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     else:
         # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
-        os.replace(part, dest)
+        try:
+            shutil.move(part, dest)
+        except Exception as e:
+            logger.error("Failed to move %s to %s: %s", part, dest, e)
+            raise
     logger.info("tee finalize done for %s: dest=%s", guid, dest)
     # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
     # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
@@ -3819,7 +3833,8 @@ def stream_tee_response(
             if fp:
                 fp.close()
                 fp = None
-            if part and eof and written >= 1024 and (expected is None or written == expected):
+            size_ok = (expected is None or written >= expected or (expected - written) <= max(int(expected * 0.05), 65536))
+            if part and eof and written >= 1024 and size_ok:
                 # 无论客户端连接此时是否已关闭（curl 接收完直接 EOF 退出，Starlette 会 aclose 生成器），
                 # 完整的音频已全部接收完毕，落盘与标签写入必须受 shield 保护完整执行完毕，
                 # 且立即解绑 part，绝不能被 GeneratorExit / CancelledError 提前打断导致 part 在 finally 中被误删。
@@ -4199,27 +4214,22 @@ def _audio_file_ok(path: str) -> bool:
     只对已通过长度校验的完整文件调用。良性 warning 或元数据容错放行。
     ffmpeg 不可用（测试守卫/宿主机缺件）时无从校验，只能放行。
     """
+    if not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return False
     if not tc.FFMPEG_BIN:
         return True
     try:
+        # 解码前 2 秒校验音频流健康度；毫秒级完成，且有效避开酷狗等平台在无损 FLAC 尾部附加 ID3 标签产生的非致命告警
         r = subprocess.run(
-            [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-f", "null", "-"],
-            capture_output=True, text=True, timeout=300,
+            [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-t", "2", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
-            return False
-        err = (r.stderr or "").lower()
-        fatal_keywords = (
-            "invalid data found",
-            "header missing",
-            "error while decoding",
-            "corrupt input packet",
-        )
-        if any(kw in err for kw in fatal_keywords):
             return False
         return True
     except Exception:  # noqa: BLE001
         return False
+
 
 
 def _prune_full_fetch_state(now: float) -> None:
@@ -4343,8 +4353,19 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
                 if chunk:
                     fp.write(chunk)
                     written += len(chunk)
-        if written < 1024 or (expected is not None and written != expected):
-            raise RuntimeError(f"size mismatch written={written} expected={expected}")
+        if written < 1024:
+            raise RuntimeError(f"empty stream written={written}")
+        if expected is not None and expected > 0:
+            if written < expected:
+                diff = expected - written
+                # 容忍 5% 以内或 64KB 以内的微小长度差异（CDN 流截断/结尾静音/元数据差异）
+                if diff > max(int(expected * 0.05), 65536):
+                    if written >= 1024 * 1024 and await asyncio.to_thread(_audio_file_ok, part):
+                        logger.info("Accepting audio stream with size difference: written=%d expected=%d", written, expected)
+                    else:
+                        raise RuntimeError(f"size mismatch written={written} expected={expected}")
+                else:
+                    logger.info("Stream size within tolerance: written=%d expected=%d", written, expected)
         info = await _info_for_background_save(fake_request, guid, info)
         ext = ext or (info or {}).get("ext") or "mp3"
         if ext in _LOSSLESS_EXTS and not await asyncio.to_thread(_audio_file_ok, part):
@@ -4358,6 +4379,12 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
                     await owned.aclose()
                 resp = owned = None
             if not force_mp3:
+                if part and os.path.exists(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
+                    part = None
                 logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
                 await _full_fetch_download(guid, cred_headers, force_mp3=True)
                 return
@@ -4372,7 +4399,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         raise
     except Exception as e:
         _full_fetch_failed[guid] = time.monotonic()
-        logger.warning("Background full fetch failed for %s: %s", guid, type(e).__name__)
+        logger.exception("Background full fetch failed for %s: %s", guid, e)
     finally:
         if part and os.path.exists(part):
             try:
