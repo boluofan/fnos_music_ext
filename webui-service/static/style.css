@@ -153,19 +153,12 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 .save-bar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
   display: flex; justify-content: flex-end; align-items: center; gap: 12px 16px;
-  padding: 10px 20px; background: rgba(255, 255, 255, 0.96);
-  border-top: 1px solid var(--line); backdrop-filter: blur(6px);
-  transform: translateY(110%);
-  opacity: 0;
-  pointer-events: none;
-  transition: transform 0.25s ease, opacity 0.25s ease;
+  padding: 12px 24px; background: rgba(255, 255, 255, 0.98);
+  border-top: 1px solid var(--line); backdrop-filter: blur(8px);
+  box-shadow: 0 -2px 10px rgba(16, 30, 54, 0.06);
 }
-#save-note { min-width: 0; overflow-wrap: anywhere; }
-.save-bar.show {
-  transform: translateY(0);
-  opacity: 1;
-  pointer-events: auto;
-}
+#save-note { min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--muted); }
+.save-bar.dirty #save-note { color: var(--accent); font-weight: 600; }
 .toast {
   position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 60;
   background: #1c2733; color: #fff; border-radius: 8px; padding: 10px 18px;

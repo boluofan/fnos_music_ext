@@ -37,17 +37,17 @@ function toast(message, kind) {
 function markDirty(note) {
   dirty = true;
   const bar = $("#save-bar");
-  if (bar) bar.classList.add("show");
+  if (bar) bar.classList.add("dirty");
   const noteEl = $("#save-note");
-  if (noteEl) noteEl.textContent = note || "有未保存的修改";
+  if (noteEl) noteEl.textContent = note || "⚠️ 有未保存的修改";
 }
 
 function clearDirty() {
   dirty = false;
   const bar = $("#save-bar");
-  if (bar) bar.classList.remove("show");
+  if (bar) bar.classList.remove("dirty");
   const noteEl = $("#save-note");
-  if (noteEl) noteEl.textContent = "";
+  if (noteEl) noteEl.textContent = "已保存，配置已生效";
 }
 
 /* -------------------------------------------------------------- 导航 */
@@ -831,5 +831,7 @@ function renderChartsUI() {
   await loadStatus();
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   await loadCharts();
+  const note = $("#save-note");
+  if (note && !dirty) note.textContent = "配置已就绪，可随时点击保存生效";
   setInterval(loadStatus, 15000);
 })();
