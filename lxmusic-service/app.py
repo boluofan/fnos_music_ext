@@ -86,8 +86,10 @@ CONF = {
     "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "20")),
     "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
     "cache_ttl": int(os.environ.get("LX_CACHE_TTL", "1800")),
-    # 用户自定义源脚本地址（state.json 持久化优先，env 仅作首次种子）
+    # 用户自定义源脚本地址（支持最多 3 个源：主源 + 备用源 1 + 备用源 2）
     "source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
+    "source_url_2": (os.environ.get("LX_SOURCE_URL_2") or "").strip(),
+    "source_url_3": (os.environ.get("LX_SOURCE_URL_3") or "").strip(),
     # 用户源单次 musicUrl 解析预算：野生源多为二级转发（脚本→中转服务→平台），
     # 实证水位在 3-8s（verify_source 用 12s），4s 会把慢源全部掐死
     "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "12.0")),
@@ -99,8 +101,10 @@ CONF = {
     "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
 }
 
-# 当前激活的用户自定义源（启动时从 state.json / LX_SOURCE_URL 恢复）
-SOURCE_MANAGER = SourceManager(seed_url=CONF["source_url"])
+# 当前激活的用户自定义源（启动时从 state.json / LX_SOURCE_URL* 恢复）
+SOURCE_MANAGER = SourceManager(
+    seed_urls=[CONF["source_url"], CONF["source_url_2"], CONF["source_url_3"]]
+)
 
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 UA_MOBILE = "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
@@ -140,11 +144,18 @@ _STATS = {"searches": 0, "url_resolutions": 0, "errors": 0}
 _RUNTIME_OVERRIDE: ContextVar[Any] = ContextVar("lx_runtime_override", default=None)
 
 
-def current_runtime():
+def current_runtimes() -> list[tuple[int, Any]]:
     override = _RUNTIME_OVERRIDE.get()
     if override is not None:
-        return override
-    return SOURCE_MANAGER.get()
+        return [(0, override)]
+    return SOURCE_MANAGER.get_runtimes()
+
+
+def current_runtime():
+    runtimes = current_runtimes()
+    if runtimes:
+        return runtimes[0][1]
+    return None
 
 
 def _lenient_json(resp: httpx.Response, tag: str = "") -> dict | list | None:
@@ -659,22 +670,39 @@ def _chain_report(name: str, ok: bool) -> None:
 
 def chain_health_snapshot() -> dict:
     now = time.time()
-    h = _CHAIN_HEALTH.get("user_source", {})
-    state = ("half_open" if h.get("half_open") else
-             "open" if h.get("open_until", 0) > now else
-             "recovery_ready" if h.get("open_until") else "closed")
-    return {"user_source": {"fails": h.get("fails", 0), "open": state == "open",
-                            "breaks": h.get("breaks", 0), "state": state}}
+    res = {}
+    for slot in range(3):
+        cname = f"user_source_{slot}"
+        h = _CHAIN_HEALTH.get(cname, {})
+        if slot == 0 and not h:
+            h = _CHAIN_HEALTH.get("user_source", {})
+        state = ("half_open" if h.get("half_open") else
+                 "open" if h.get("open_until", 0) > now else
+                 "recovery_ready" if h.get("open_until") else "closed")
+        res[cname] = {"fails": h.get("fails", 0), "open": state == "open",
+                      "breaks": h.get("breaks", 0), "state": state}
+    res["user_source"] = res.get("user_source_0", {})
+    return res
 
 
 def source_capabilities() -> dict:
-    runtime = SOURCE_MANAGER.get()
-    ready = runtime is not None
-    configured = bool(SOURCE_MANAGER.active_url or SOURCE_MANAGER.seed_url)
+    active_runtimes = [r for _, r in current_runtimes()]
+    ready = bool(active_runtimes)
+    configured = bool(any(SOURCE_MANAGER.active_urls) or any(SOURCE_MANAGER.seed_urls))
     result = {}
     for src in _SEARCHERS:
-        supported = ready and src in runtime.platforms
-        available = supported and _chain_available("user_source")
+        sup_runtimes = [r for r in active_runtimes if src in r.platforms]
+        supported = bool(sup_runtimes)
+        available = False
+        qualitys: list[str] = []
+        for slot, r in current_runtimes():
+            if src in r.platforms:
+                cname = f"user_source_{slot}"
+                if _chain_available(cname) or (slot == 0 and _chain_available("user_source")):
+                    available = True
+                for q in r.qualitys(src):
+                    if q not in qualitys:
+                        qualitys.append(q)
         if available:
             reason = ""
         elif not ready:
@@ -685,7 +713,7 @@ def source_capabilities() -> dict:
             reason = "source_circuit_open"
         result[src] = {"search_available": bool(available), "playback_available": bool(available),
                        "user_source": bool(supported),
-                       "qualitys": runtime.qualitys(src) if supported else [],
+                       "qualitys": qualitys,
                        "reason": reason,
                        "validation_status": "unverified", "completeness": "unknown"}
     return result
@@ -797,11 +825,11 @@ async def _fill_script_meta(client: httpx.AsyncClient, src: str, item: dict, ide
 
 async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
                              tier: str = "standard", retained: dict | None = None) -> "dict | None":
-    """Shared search/URL pipeline: user source musicUrl -> verify -> downgrade."""
+    """Shared search/URL pipeline: user source musicUrl -> verify -> downgrade -> fallback to backup sources."""
     if _explicit_trial(item) or any(m in str(item.get("title") or "") for m in _TRIAL_TITLE_MARKERS):
         return None
-    runtime = current_runtime()
-    if runtime is None or src not in runtime.platforms:
+    candidates = [(slot, r) for slot, r in current_runtimes() if src in r.platforms]
+    if not candidates:
         return None
     tiers = _quality_tiers(tier)
     cached = _fresh_probe(item, tiers[0])
@@ -816,46 +844,66 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
     attempted = []
     best = None
     failures = _RESOLUTION_FAILURES.get()
-    for t in tiers:
-        # Once a better known tier is retained, lower tiers cannot improve it.
-        if best and _TIER_RANK.get(best["actual_tier"], -1) >= _TIER_RANK[t]:
-            break
-        before = len(failures or [])
-        quality = script_quality_for_tier(t, runtime.qualitys(src))
-        if quality is None:
-            attempted.append(t)
+
+    for slot, runtime in candidates:
+        circuit_name = f"user_source_{slot}"
+        # 兼容旧 circuit 命名
+        if not _chain_acquire(circuit_name) and not (slot == 0 and _chain_acquire("user_source")):
+            _record_failure(ChainTransportError(f"user source slot {slot} circuit open"))
             continue
-        if not _chain_acquire("user_source"):
-            _record_failure(ChainTransportError("user source circuit open"))
+        recovering = bool(_CHAIN_HEALTH.get(circuit_name, {}).get("half_open"))
+        slot_best = None
+
+        for t in tiers:
+            # Once a better known tier is retained, lower tiers cannot improve it.
+            if slot_best and _TIER_RANK.get(slot_best["actual_tier"], -1) >= _TIER_RANK[t]:
+                break
+            before = len(failures or [])
+            quality = script_quality_for_tier(t, runtime.qualitys(src))
+            if quality is None:
+                attempted.append(t)
+                continue
+            result = None
+            try:
+                url = await runtime.music_url(
+                    music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
+                )
+                result = await _verify_result(client, {"url": url}, report_transport=True)
+            except asyncio.CancelledError:
+                # Deadline/client cancellation says nothing about source health.
+                _CHAIN_HEALTH.get(circuit_name, {}).pop("half_open", None)
+                if slot == 0:
+                    _CHAIN_HEALTH.get("user_source", {}).pop("half_open", None)
+                raise
+            except Exception as exc:  # transport, timeout, or script rejection
+                _record_failure(exc)
+                _chain_report(circuit_name, False)
+                if slot == 0:
+                    _chain_report("user_source", False)
+            else:
+                # A clean resolve without usable media is not a source outage.
+                if recovering or not _CHAIN_HEALTH.get(circuit_name, {}).get("open_until"):
+                    _chain_report(circuit_name, True)
+                    if slot == 0:
+                        _chain_report("user_source", True)
+            if result:
+                result["resolver"] = circuit_name
+                if not slot_best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(slot_best["actual_tier"], -1):
+                    slot_best = result
+                    if retained is not None:
+                        retained.update(best=slot_best, attempted=attempted)
+            # Infrastructure-interrupted tiers must not be cached as exhausted.
+            if len(failures or []) == before:
+                attempted.append(t)
+
+        if slot_best:
+            best = slot_best
+            if slot > 0:
+                logger.info("lx resolve fallback to slot %d succeeded for %s:%s", slot, src, identifier)
             break
-        recovering = bool(_CHAIN_HEALTH.get("user_source", {}).get("half_open"))
-        result = None
-        try:
-            url = await runtime.music_url(
-                music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
-            )
-            result = await _verify_result(client, {"url": url}, report_transport=True)
-        except asyncio.CancelledError:
-            # Deadline/client cancellation says nothing about source health.
-            _CHAIN_HEALTH.get("user_source", {}).pop("half_open", None)
-            raise
-        except Exception as exc:  # transport, timeout, or script rejection
-            _record_failure(exc)
-            _chain_report("user_source", False)
         else:
-            # A clean resolve without usable media is not a source outage.
-            # A late pre-open request must not close a circuit opened by siblings.
-            if recovering or not _CHAIN_HEALTH.get("user_source", {}).get("open_until"):
-                _chain_report("user_source", True)
-        if result:
-            result["resolver"] = "user_source"
-            if not best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(best["actual_tier"], -1):
-                best = result
-                if retained is not None:
-                    retained.update(best=best, attempted=attempted)
-        # Infrastructure-interrupted tiers must not be cached as exhausted.
-        if len(failures or []) == before:
-            attempted.append(t)
+            logger.info("lx resolve on slot %d failed for %s:%s, trying next candidate source...", slot, src, identifier)
+
     if best:
         best["attempted_tiers"] = attempted
         item["_probe"] = dict(best, ts=time.time(), tier=best["actual_tier"])
@@ -1715,6 +1763,8 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
 class SourceBody(BaseModel):
     url: str = ""
     script: str = ""  # 上传场景：脚本文本（与 url 二选一；url 可为 file:// 上传地址）
+    slot: int = 0  # 槽位编号（0: 主音源, 1: 备用源 1, 2: 备用源 2）
+    urls: list[str] | None = None  # 批量设置槽位 URL 列表
 
 
 @app.get("/api/v1/source")
@@ -1770,7 +1820,21 @@ async def source_upload(body: UploadBody):
 
 @app.post("/api/v1/source")
 async def source_set(body: SourceBody):
-    """校验并切换当前激活源（state.json 持久化，热生效）。"""
+    """校验并切换当前激活源（state.json 持久化，热生效，支持 3 槽位）。"""
+    slot = body.slot if (0 <= body.slot < 3) else 0
+
+    if body.urls is not None:
+        for s_idx, u in enumerate(body.urls[:3]):
+            u_str = (u or "").strip()
+            if u_str:
+                if is_source_url(u_str):
+                    await SOURCE_MANAGER.activate(u_str, slot=s_idx)
+                    _CHAIN_HEALTH.pop(f"user_source_{s_idx}", None)
+            else:
+                await SOURCE_MANAGER.deactivate(slot=s_idx)
+        _CHAIN_HEALTH.pop("user_source", None)
+        return {"ok": True, "data": SOURCE_MANAGER.describe()}
+
     url = (body.url or "").strip()
     if not url and body.script:
         # 直接以脚本文本激活（先落盘为上传文件，再走统一 file:// 链路）
@@ -1781,7 +1845,8 @@ async def source_set(body: SourceBody):
                 content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
             )
         try:
-            _path, url = save_upload(SOURCE_MANAGER.state_dir, "source.js", body.script)
+            cache_name = "source.js" if slot == 0 else f"source_{slot}.js"
+            _path, url = save_upload(SOURCE_MANAGER.state_dir, cache_name, body.script)
         except (SourceError, OSError) as exc:
             return JSONResponse(
                 content={"ok": False, "error": f"保存上传脚本失败: {exc}", "category": "download"}, status_code=500
@@ -1789,25 +1854,35 @@ async def source_set(body: SourceBody):
     if not is_source_url(url):
         return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
-        await SOURCE_MANAGER.activate(url)
+        await SOURCE_MANAGER.activate(url, slot=slot)
     except SourceError as exc:
         return JSONResponse(
             content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
         )
-    # 旧源攒下的熔断状态（连续解析失败/open）不应连带拦截新源：换源即清零健康度
-    _CHAIN_HEALTH.pop("user_source", None)
+    # 旧源攒下的熔断状态不应连带拦截新源：换源即清零对应槽位健康度
+    _CHAIN_HEALTH.pop(f"user_source_{slot}", None)
+    if slot == 0:
+        _CHAIN_HEALTH.pop("user_source", None)
     return {"ok": True, "data": SOURCE_MANAGER.describe()}
 
 
 @app.delete("/api/v1/source")
-async def source_clear():
-    """停用当前源并清除持久化状态。"""
+async def source_clear(slot: int | None = None):
+    """停用当前源并清除持久化状态（支持按 slot 停用或停用全部）。"""
+    if slot is not None and 0 <= slot < 3:
+        await SOURCE_MANAGER.deactivate(slot=slot)
+        _CHAIN_HEALTH.pop(f"user_source_{slot}", None)
+        if slot == 0:
+            _CHAIN_HEALTH.pop("user_source", None)
+        return {"ok": True, "data": SOURCE_MANAGER.describe()}
+
     await SOURCE_MANAGER.shutdown()
-    SOURCE_MANAGER.active_url = ""
-    SOURCE_MANAGER.last_error = ""
-    for path in (SOURCE_MANAGER.state_path, SOURCE_MANAGER.script_cache):
+    SOURCE_MANAGER.active_urls = ["", "", ""]
+    SOURCE_MANAGER.last_errors = ["", "", ""]
+    for path in [SOURCE_MANAGER.state_path, *SOURCE_MANAGER.script_caches]:
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+    _CHAIN_HEALTH.clear()
     return {"ok": True, "data": SOURCE_MANAGER.describe()}

@@ -555,10 +555,22 @@ class UserSource:
         }
 
 
-class SourceManager:
-    """当前激活源管理：state.json 持久化（URL + 脚本缓存），env 仅作首次种子。"""
+MAX_SOURCE_SLOTS = 3
 
-    def __init__(self, state_dir: "str | None" = None, seed_url: str = ""):
+
+class SourceManager:
+    """当前激活源管理：支持最多 3 个槽位（主音源 + 2 个备用音源）。
+    
+    state.json 持久化（URL 列表 + 脚本缓存），env 仅作首次种子。
+    遇单源不可播时按序回退到备用源寻找可用资源。
+    """
+
+    def __init__(
+        self,
+        state_dir: "str | None" = None,
+        seed_url: str = "",
+        seed_urls: "list[str] | None" = None,
+    ):
         base = state_dir or os.environ.get("LX_DATA_DIR") or "/data/lxmusic"
         try:
             self.state_dir = Path(base)
@@ -570,12 +582,49 @@ class SourceManager:
             self.state_dir = Path(tempfile.mkdtemp(prefix="lxmusic-state-"))
             logger.warning("lx data dir %s not writable, falling back to %s", base, self.state_dir)
         self.state_path = self.state_dir / "state.json"
-        self.script_cache = self.state_dir / "source.js"
-        self.seed_url = (seed_url or os.environ.get("LX_SOURCE_URL") or "").strip()
-        self._runtime: "UserSource | None" = None
+        
+        # 3 个槽位的脚本缓存路径（slot 0 保留 source.js 保证向下兼容）
+        self.script_caches: list[Path] = [
+            self.state_dir / "source.js",
+            self.state_dir / "source_1.js",
+            self.state_dir / "source_2.js",
+        ]
+        self.script_cache = self.script_caches[0]
+
+        # 种子 URL（env / 参数）
+        seeds: list[str] = ["", "", ""]
+        if seed_urls:
+            for i, u in enumerate(seed_urls[:MAX_SOURCE_SLOTS]):
+                seeds[i] = (u or "").strip()
+        elif seed_url:
+            seeds[0] = seed_url.strip()
+        else:
+            seeds[0] = (os.environ.get("LX_SOURCE_URL") or "").strip()
+            seeds[1] = (os.environ.get("LX_SOURCE_URL_2") or "").strip()
+            seeds[2] = (os.environ.get("LX_SOURCE_URL_3") or "").strip()
+        self.seed_urls = seeds
+        self.seed_url = seeds[0]
+
+        self._runtimes: list[UserSource | None] = [None, None, None]
         self._lock = asyncio.Lock()
-        self.active_url = ""
-        self.last_error = ""
+        self.active_urls: list[str] = ["", "", ""]
+        self.last_errors: list[str] = ["", "", ""]
+
+    @property
+    def active_url(self) -> str:
+        return self.active_urls[0]
+
+    @active_url.setter
+    def active_url(self, val: str) -> None:
+        self.active_urls[0] = val
+
+    @property
+    def last_error(self) -> str:
+        return self.last_errors[0]
+
+    @last_error.setter
+    def last_error(self, val: str) -> None:
+        self.last_errors[0] = val
 
     # ------------------------------------------------------------------ 状态
 
@@ -586,95 +635,170 @@ class SourceManager:
         except (OSError, ValueError):
             return {}
 
-    def _write_state(self, url: str, script: str) -> None:
+    def _write_state(self) -> None:
         try:
+            payload = {
+                "url": self.active_urls[0],
+                "urls": list(self.active_urls),
+                "activated_at": time.time(),
+            }
             self.state_path.write_text(
-                json.dumps({"url": url, "activated_at": time.time()}, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
                 encoding="utf-8",
             )
-            self.script_cache.write_text(script, encoding="utf-8")
         except OSError as exc:
             logger.warning("cannot persist lx source state: %s", exc)
 
-    # ------------------------------------------------------------------ 激活/加载
+    # ------------------------------------------------------------------ 激活/加载/停用
 
-    async def activate(self, url: str, *, script: "str | None" = None) -> UserSource:
-        """校验并切换到给定 URL 的源（成功后旧运行时立即停用）。"""
+    async def activate(self, url: str, slot: int = 0, *, script: "str | None" = None) -> UserSource:
+        """校验并切换到给定槽位的源（成功后旧槽位运行时立即停用）。"""
+        if not (0 <= slot < MAX_SOURCE_SLOTS):
+            raise SourceError("invalid", f"无效的槽位编号: {slot} (必须在 0~{MAX_SOURCE_SLOTS - 1} 之间)")
         async with self._lock:
             script = script if script is not None else await download_script(url)
             meta = parse_script_meta(script)
             runtime = UserSource(script, meta, script_dir=str(self.state_dir))
             await runtime.start()
-            old = self._runtime
-            self._runtime = runtime
-            self.active_url = url
-            self.last_error = ""
-            self._write_state(url, script)
+
+            old = self._runtimes[slot]
+            self._runtimes[slot] = runtime
+            self.active_urls[slot] = url
+            self.last_errors[slot] = ""
+            
+            # 持久化脚本缓存
+            try:
+                self.script_caches[slot].write_text(script, encoding="utf-8")
+                if slot == 0 and (self.state_dir / "source_0.js") != self.script_caches[0]:
+                    try:
+                        (self.state_dir / "source_0.js").write_text(script, encoding="utf-8")
+                    except OSError:
+                        pass
+            except OSError as exc:
+                logger.warning("cannot cache lx script for slot %d: %s", slot, exc)
+
+            self._write_state()
+
             if old is not None:
                 await old.stop()
             return runtime
 
+    async def deactivate(self, slot: int = 0) -> None:
+        """停用指定槽位的源。"""
+        if not (0 <= slot < MAX_SOURCE_SLOTS):
+            return
+        async with self._lock:
+            old = self._runtimes[slot]
+            self._runtimes[slot] = None
+            self.active_urls[slot] = ""
+            self.last_errors[slot] = ""
+            try:
+                self.script_caches[slot].unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._write_state()
+            if old is not None:
+                await old.stop()
+
+    async def load_slot(self, slot: int, url: str) -> None:
+        """加载单个槽位源脚本（优先下载，失败回退对应槽位缓存）。"""
+        if not url:
+            return
+        script = None
+        cache_file = self.script_caches[slot]
+        try:
+            script = await download_script(url)
+        except SourceError as exc:
+            self.last_errors[slot] = f"{exc.category}: {exc}"
+            logger.warning("lx source slot %d download failed (%s), trying cache", slot, exc)
+            if cache_file.exists():
+                try:
+                    script = cache_file.read_text(encoding="utf-8")
+                    parse_script_meta(script)
+                except (OSError, SourceError, UnicodeDecodeError):
+                    script = None
+        if script is None:
+            logger.warning("lx source slot %d unavailable: no script (url=%s)", slot, url[:120])
+            return
+        try:
+            meta = parse_script_meta(script)
+            runtime = UserSource(script, meta, script_dir=str(self.state_dir))
+            await runtime.start()
+            self._runtimes[slot] = runtime
+            self.active_urls[slot] = url
+            logger.info("lx source slot %d loaded from %s", slot, "cache" if self.last_errors[slot] else "download")
+        except SourceError as exc:
+            self.last_errors[slot] = f"{exc.category}: {exc}"
+            logger.warning("lx source slot %d init failed: %s", slot, exc)
+
     async def load(self) -> None:
-        """服务启动时加载：state.json 的 URL 优先，env 为种子；下载失败回退缓存脚本。"""
-        # issue #29：先清扫上次异常退出（SIGKILL/断电）留下的孤儿 bridge，再拉起新进程，
-        # 避免"多个同名 bridge.js 叠加常驻高 CPU"复发。活跃父进程下的进程一律不动。
+        """服务启动时加载：支持最多 3 个槽位。state.json 优先，env 种子兜底。"""
         try:
             reap_orphan_bridges()
         except Exception as exc:  # noqa: BLE001
             logger.warning("orphan bridge reaper failed (ignored): %s", type(exc).__name__)
         async with self._lock:
-            if self._runtime is not None:
-                return
             state = self.read_state()
-            url = str(state.get("url") or "").strip() or self.seed_url
-            if not url:
-                logger.info("no lx source configured (state/env both empty)")
+            state_urls = state.get("urls")
+            if not isinstance(state_urls, list) or len(state_urls) == 0:
+                # 兼容旧版本仅有单 url 字段的 state.json
+                single_url = str(state.get("url") or "").strip()
+                state_urls = [single_url, "", ""]
+            
+            target_urls: list[str] = ["", "", ""]
+            for i in range(MAX_SOURCE_SLOTS):
+                u_state = str(state_urls[i] if i < len(state_urls) else "").strip()
+                u_seed = str(self.seed_urls[i] if i < len(self.seed_urls) else "").strip()
+                target_urls[i] = u_state or u_seed
+
+            if not any(target_urls):
+                logger.info("no lx sources configured (state/env both empty)")
                 return
-            script = None
-            try:
-                script = await download_script(url)
-            except SourceError as exc:
-                self.last_error = f"{exc.category}: {exc}"
-                logger.warning("lx source download failed (%s), trying cache", exc)
-                if self.script_cache.exists():
-                    try:
-                        script = self.script_cache.read_text(encoding="utf-8")
-                        parse_script_meta(script)
-                    except (OSError, SourceError, UnicodeDecodeError):
-                        script = None
-            if script is None:
-                logger.warning("lx source unavailable: no script (url=%s)", url[:120])
-                return
-            try:
-                meta = parse_script_meta(script)
-                runtime = UserSource(script, meta, script_dir=str(self.state_dir))
-                await runtime.start()
-                self._runtime = runtime
-                self.active_url = url
-                logger.info("lx source restored from %s", "cache" if self.last_error else "download")
-            except SourceError as exc:
-                self.last_error = f"{exc.category}: {exc}"
-                logger.warning("lx source init failed: %s", exc)
+
+            for slot in range(MAX_SOURCE_SLOTS):
+                if self._runtimes[slot] is not None:
+                    continue
+                url = target_urls[slot]
+                if url:
+                    await self.load_slot(slot, url)
 
     async def shutdown(self) -> None:
         async with self._lock:
-            runtime = self._runtime
-            self._runtime = None
-            if runtime is not None:
-                await runtime.stop()
+            runtimes = list(self._runtimes)
+            self._runtimes = [None, None, None]
+            for r in runtimes:
+                if r is not None:
+                    await r.stop()
 
-    def get(self) -> "UserSource | None":
-        runtime = self._runtime
-        if runtime is not None and runtime.running:
-            return runtime
+    def get(self, slot: int = 0) -> "UserSource | None":
+        if 0 <= slot < MAX_SOURCE_SLOTS:
+            runtime = self._runtimes[slot]
+            if runtime is not None and runtime.running:
+                return runtime
         return None
 
+    def get_runtimes(self) -> "list[tuple[int, UserSource]]":
+        """按优先级返回所有处于就绪状态的 (slot_index, runtime) 元组。"""
+        res = []
+        for i, r in enumerate(self._runtimes):
+            if r is not None and r.running:
+                res.append((i, r))
+        return res
+
     def describe(self) -> dict:
-        runtime = self.get()
+        runtimes = self.get_runtimes()
+        primary = self.get(0)
         return {
-            "configured": bool(self.active_url or self.seed_url),
-            "url": self.active_url or self.seed_url,
-            "initialized": runtime is not None,
-            "last_error": self.last_error,
-            "source": runtime.describe() if runtime is not None else None,
+            "configured": bool(any(self.active_urls) or any(self.seed_urls)),
+            "url": self.active_urls[0] or self.seed_urls[0],
+            "urls": [self.active_urls[i] or self.seed_urls[i] for i in range(MAX_SOURCE_SLOTS)],
+            "initialized": bool(runtimes),
+            "last_error": self.last_errors[0],
+            "last_errors": list(self.last_errors),
+            "source": primary.describe() if primary is not None else None,
+            "sources": [
+                (r.describe() if (r and r.running) else None)
+                for r in self._runtimes
+            ],
         }
+

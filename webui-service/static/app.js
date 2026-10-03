@@ -133,6 +133,8 @@ function applyConfigToForm() {
   $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
   $("#lx-url").value = v.LX_SOURCE_URL || "";
+  $("#lx-url-2").value = v.LX_SOURCE_URL_2 || "";
+  $("#lx-url-3").value = v.LX_SOURCE_URL_3 || "";
   lxVerifiedUrl = v.LX_SOURCE_URL || null;
   renderPlatformChips();
 }
@@ -180,8 +182,12 @@ function collectConfig() {
   }
   if (provider === "lxmusic") {
     const url = $("#lx-url").value.trim();
-    if (!url) throw new Error("洛雪源需要填写脚本 URL");
+    const url2 = $("#lx-url-2").value.trim();
+    const url3 = $("#lx-url-3").value.trim();
+    if (!url && !url2 && !url3) throw new Error("洛雪源至少需要填写一个脚本 URL（主音源）");
     values.LX_SOURCE_URL = url;
+    values.LX_SOURCE_URL_2 = url2;
+    values.LX_SOURCE_URL_3 = url3;
   }
   return values;
 }
@@ -384,50 +390,6 @@ function stopQrPolling() {
 }
 $("#qr-btn").addEventListener("click", startQrLogin);
 
-/* -------------------------------------------------------------- lx 源测试 */
-$("#lx-test").addEventListener("click", async () => {
-  const url = $("#lx-url").value.trim();
-  const box = $("#lx-report");
-  if (!url) { toast("请先填写源 URL", "fail"); return; }
-  box.hidden = false;
-  box.className = "report";
-  box.textContent = "测试中（下载脚本 → 沙箱初始化 → 多首抽样搜索/解析/探活）…";
-  const callVerify = () => api("/api/lx/verify", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ values: { url } }),
-  });
-  try {
-    let r;
-    try {
-      r = await callVerify();
-    } catch (exc) {
-      // lxmusic 进程未运行（未点选/预览过期）：临时拉起后重试一次
-      if (!await startPreview("lxmusic")) throw exc;
-      r = await callVerify();
-    }
-    if (r.ok) {
-      const d = r.data || {};
-      const meta = d.meta || {};
-      const probe = d.probe || {};
-      lxVerifiedUrl = url;
-      box.className = "report ok";
-      box.innerHTML =
-        `<div class="kv"><b>源名称</b>${meta.name || "-"} ${meta.version ? "v" + meta.version : ""}（${meta.author || "未知作者"}）</div>` +
-        `<div class="kv"><b>可用平台</b>${(d.platforms || []).join("、")}</div>` +
-        (probe.title ? `<div class="kv"><b>实测</b>${probe.title} - ${probe.artist} [${probe.platform}/${probe.quality}] ${probe.content_type || ""}</div>` : "") +
-        `<div class="kv"><b>结论</b>可用 ✓（保存后激活）</div>`;
-    } else {
-      const d = r.data || {};
-      box.className = "report fail";
-      box.innerHTML = `<div class="kv"><b>不可用</b>${d.message || r.error || "校验失败"}</div>`;
-    }
-  } catch (exc) {
-    box.className = "report fail";
-    box.textContent = "测试失败：" + exc.message;
-  }
-});
-
 /* -------------------------------------------------- lx 源：文件上传 / NAS 选择 */
 async function lxUploadScript(filename, script) {
   // 先确保 lxmusic 进程可用（预览拉起），再转发落盘
@@ -444,36 +406,6 @@ async function lxUploadScript(filename, script) {
   }
 }
 
-async function lxAfterUpload(r) {
-  const d = r.data || {};
-  $("#lx-url").value = d.url || "";
-  lxVerifiedUrl = null; // 上传地址仍需走一次"测试"
-  $("#lx-upload-note").textContent = d.meta && d.meta.name ? `已上传：${d.meta.name}` : "已上传";
-  markDirty("洛雪源已更新为上传脚本，测试后保存生效");
-  toast("脚本已上传，请点「测试」验证后保存", "ok");
-}
-
-$("#lx-upload").addEventListener("click", () => $("#lx-file").click());
-$("#lx-file").addEventListener("change", async () => {
-  const file = $("#lx-file").files && $("#lx-file").files[0];
-  if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".js")) { toast("只支持 .js 后缀文件", "fail"); return; }
-  if (file.size > 9_000_000) { toast("脚本超过 9MB 上限", "fail"); return; }
-  $("#lx-upload-note").textContent = "读取并上传中…";
-  try {
-    const script = await file.text();
-    const r = await lxUploadScript(file.name, script);
-    await lxAfterUpload(r);
-  } catch (exc) {
-    $("#lx-upload-note").textContent = "";
-    toast("上传失败：" + exc.message, "fail");
-  } finally {
-    $("#lx-file").value = ""; // 允许重复选择同一文件
-  }
-});
-
-/* NAS 文件选择：仅桌面环境（统一网关 /app/fnmusic-ext 内）可用。
-   选中的主机路径经 /api/host-file 代读（webui_gateway 本地处理），再走上传落盘。 */
 let lxTrimSdk = null;
 async function lxLoadTrimSdk() {
   if (lxTrimSdk !== null) return lxTrimSdk;
@@ -486,51 +418,146 @@ async function lxLoadTrimSdk() {
   return lxTrimSdk;
 }
 
-async function lxPickFromNas() {
-  const sdk = await lxLoadTrimSdk();
-  if (!sdk) { toast("当前环境不支持 NAS 文件选择（直连 8774 时请用上传或 URL）", "fail"); return; }
-  try {
-    const result = await sdk.pickUserFile({
-      directory: false,
-      accept: [".js"],
-      title: "选择洛雪源脚本",
-      okText: "选择",
-      sidebarGroup: ["myFiles", "otherShare", "favorites"],
-    });
-    const paths = (result && result.data) || [];
-    if (!paths.length) return;
-    const hostPath = paths[0];
-    $("#lx-upload-note").textContent = "读取 NAS 文件中…";
-    const resp = await fetch(APP_BASE + "/api/host-file", {
+/* -------------------------------------------------------------- 3 槽位配置绑定 */
+function setupLxSlot(slotIndex, inputSel, testBtnSel, uploadBtnSel, fileSel, pickBtnSel, reportSel, noteSel, slotLabel) {
+  const inputEl = $(inputSel);
+  const testBtn = $(testBtnSel);
+  const uploadBtn = $(uploadBtnSel);
+  const fileEl = $(fileSel);
+  const pickBtn = $(pickBtnSel);
+  const reportBox = $(reportSel);
+  const noteEl = $(noteSel);
+
+  if (!inputEl || !testBtn) return;
+
+  // 测试按钮
+  testBtn.addEventListener("click", async () => {
+    const url = inputEl.value.trim();
+    if (!url) { toast(`请先填写${slotLabel} URL`, "fail"); return; }
+    reportBox.hidden = false;
+    reportBox.className = "report";
+    reportBox.textContent = `测试中（下载脚本 → 沙箱初始化 → 多首抽样搜索/解析/探活）…`;
+    const callVerify = () => api("/api/lx/verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: hostPath }),
+      body: JSON.stringify({ values: { url } }),
     });
-    let body = {};
-    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
-    if (!resp.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
-    const filename = hostPath.split("/").pop() || "source.js";
-    const r = await lxUploadScript(filename, body.script || "");
-    await lxAfterUpload(r);
-  } catch (exc) {
-    $("#lx-upload-note").textContent = "";
-    toast("NAS 选择失败：" + exc.message, "fail");
+    try {
+      let r;
+      try {
+        r = await callVerify();
+      } catch (exc) {
+        if (!await startPreview("lxmusic")) throw exc;
+        r = await callVerify();
+      }
+      if (r.ok) {
+        const d = r.data || {};
+        const meta = d.meta || {};
+        const probe = d.probe || {};
+        reportBox.className = "report ok";
+        reportBox.innerHTML =
+          `<div class="kv"><b>源名称</b>${meta.name || "-"} ${meta.version ? "v" + meta.version : ""}（${meta.author || "未知作者"}）</div>` +
+          `<div class="kv"><b>可用平台</b>${(d.platforms || []).join("、")}</div>` +
+          (probe.title ? `<div class="kv"><b>实测</b>${probe.title} - ${probe.artist} [${probe.platform}/${probe.quality}] ${probe.content_type || ""}</div>` : "") +
+          `<div class="kv"><b>结论</b>可用 ✓（保存后生效）</div>`;
+      } else {
+        const d = r.data || {};
+        reportBox.className = "report fail";
+        reportBox.innerHTML = `<div class="kv"><b>不可用</b>${d.message || r.error || "校验失败"}</div>`;
+      }
+    } catch (exc) {
+      reportBox.className = "report fail";
+      reportBox.textContent = "测试失败：" + exc.message;
+    }
+  });
+
+  // 上传按钮
+  if (uploadBtn && fileEl) {
+    uploadBtn.addEventListener("click", () => fileEl.click());
+    fileEl.addEventListener("change", async () => {
+      const file = fileEl.files && fileEl.files[0];
+      if (!file) return;
+      if (!file.name.toLowerCase().endsWith(".js")) { toast("只支持 .js 后缀文件", "fail"); return; }
+      if (file.size > 9_000_000) { toast("脚本超过 9MB 上限", "fail"); return; }
+      if (noteEl) noteEl.textContent = "读取并上传中…";
+      try {
+        const script = await file.text();
+        const r = await lxUploadScript(file.name, script);
+        const d = r.data || {};
+        inputEl.value = d.url || "";
+        if (noteEl) noteEl.textContent = d.meta && d.meta.name ? `已上传：${d.meta.name}` : "已上传";
+        markDirty(`${slotLabel}已更新为上传脚本，测试后保存生效`);
+        toast("脚本已上传，请点「测试」验证后保存", "ok");
+      } catch (exc) {
+        if (noteEl) noteEl.textContent = "";
+        toast("上传失败：" + exc.message, "fail");
+      } finally {
+        fileEl.value = "";
+      }
+    });
+  }
+
+  // NAS 文件选择
+  if (pickBtn) {
+    pickBtn.addEventListener("click", async () => {
+      const sdk = await lxLoadTrimSdk();
+      if (!sdk) { toast("当前环境不支持 NAS 文件选择（直连 8774 时请用上传或 URL）", "fail"); return; }
+      try {
+        const result = await sdk.pickUserFile({
+          directory: false,
+          accept: [".js"],
+          title: `选择${slotLabel}脚本`,
+          okText: "选择",
+          sidebarGroup: ["myFiles", "otherShare", "favorites"],
+        });
+        const paths = (result && result.data) || [];
+        if (!paths.length) return;
+        const hostPath = paths[0];
+        if (noteEl) noteEl.textContent = "读取 NAS 文件中…";
+        const resp = await fetch(APP_BASE + "/api/host-file", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: hostPath }),
+        });
+        let body = {};
+        try { body = await resp.json(); } catch (_) {}
+        if (!resp.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+        const filename = hostPath.split("/").pop() || "source.js";
+        const r = await lxUploadScript(filename, body.script || "");
+        const d = r.data || {};
+        inputEl.value = d.url || "";
+        if (noteEl) noteEl.textContent = d.meta && d.meta.name ? `已上传：${d.meta.name}` : "已上传";
+        markDirty(`${slotLabel}已更新为上传脚本，测试后保存生效`);
+        toast("脚本已上传，请点「测试」验证后保存", "ok");
+      } catch (exc) {
+        if (noteEl) noteEl.textContent = "";
+        toast("NAS 选择失败：" + exc.message, "fail");
+      }
+    });
   }
 }
-$("#lx-pick").addEventListener("click", lxPickFromNas);
+
+setupLxSlot(0, "#lx-url", "#lx-test", "#lx-upload", "#lx-file", "#lx-pick", "#lx-report", "#lx-upload-note", "主音源");
+setupLxSlot(1, "#lx-url-2", "#lx-test-2", "#lx-upload-2", "#lx-file-2", "#lx-pick-2", "#lx-report-2", "#lx-upload-note-2", "备用音源 1");
+setupLxSlot(2, "#lx-url-3", "#lx-test-3", "#lx-upload-3", "#lx-file-3", "#lx-pick-3", "#lx-report-3", "#lx-upload-note-3", "备用音源 2");
 
 (async function detectNasPicker() {
-  // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
   const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
   if (pathname.startsWith("/app/")) {
     const sdk = await lxLoadTrimSdk();
-    if (sdk) $("#lx-pick").hidden = false;
+    if (sdk) {
+      if ($("#lx-pick")) $("#lx-pick").hidden = false;
+      if ($("#lx-pick-2")) $("#lx-pick-2").hidden = false;
+      if ($("#lx-pick-3")) $("#lx-pick-3").hidden = false;
+    }
   }
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
-  $(sel).addEventListener("input", () => markDirty()));
+["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#lx-url-2", "#lx-url-3", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) => {
+  const el = $(sel);
+  if (el) el.addEventListener("input", () => markDirty());
+});
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));

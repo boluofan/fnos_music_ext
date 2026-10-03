@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>fnmusic-ext 管理台</title>
-  <link rel="stylesheet" href="/app/fnmusic-ext/static/style.css?v=2.6.3">
+  <link rel="stylesheet" href="/app/fnmusic-ext/static/style.css?v=2.6.3.1">
   <link rel="icon" type="image/png" href="/app/fnmusic-ext/static/icon.png">
 </head>
 <body>
@@ -101,22 +101,59 @@
           </div>
         </div>
 
-        <!-- lx：源 URL / 文件上传 -->
+        <!-- lx：多源配置（主音源 + 备用音源 1 + 备用音源 2） -->
         <div class="subpanel" id="panel-lxmusic" hidden>
           <div class="card">
-            <div class="card-title">洛雪自定义源</div>
-            <p class="hint">三种方式任选：粘贴源脚本地址（http/https）、上传电脑上的 .js 文件、从 NAS 文件选择（桌面内可用）。保存前会自动做端到端校验。</p>
-            <div class="btn-row">
-              <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js 或 file:///data/lxmusic/uploads/xxx.js">
-              <button class="btn" id="lx-test">测试</button>
-            </div>
-            <div class="btn-row">
+            <div class="card-title">洛雪自定义源（多源自动切换）</div>
+            <p class="hint">支持配置 3 个洛雪音源。播放音乐时优先使用<b>主音源</b>解析；若遇到无版权、VIP限制或播放失败，后台将自动切换至<b>备用源 1</b>、<b>备用源 2</b> 继续寻找可用资源！</p>
+            
+            <!-- 槽位 1：主音源 -->
+            <div class="field" style="margin-top: 14px;">
+              <span style="font-weight: 600; display: flex; justify-content: space-between;">
+                <span>主音源（首选音源）</span>
+                <span id="lx-upload-note" class="muted" style="font-size: 12px; font-weight: normal;"></span>
+              </span>
+              <div class="btn-row">
+                <input class="input grow" id="lx-url" placeholder="主音源地址 (http/https 或 file:///data/lxmusic/uploads/xxx.js)">
+                <button class="btn" id="lx-test" type="button">测试</button>
+                <button class="btn" id="lx-upload" type="button">上传 .js</button>
+                <button class="btn" id="lx-pick" type="button" hidden>从 NAS 选择</button>
+              </div>
               <input type="file" id="lx-file" accept=".js" hidden>
-              <button class="btn" id="lx-upload">上传 .js 文件</button>
-              <button class="btn" id="lx-pick" hidden>从 NAS 选择</button>
-              <span id="lx-upload-note" class="muted"></span>
+              <div id="lx-report" class="report" hidden></div>
             </div>
-            <div id="lx-report" class="report" hidden></div>
+
+            <!-- 槽位 2：备用源 1 -->
+            <div class="field" style="margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 14px;">
+              <span style="font-weight: 600; display: flex; justify-content: space-between;">
+                <span>备用音源 1（主源失效时自动切换）</span>
+                <span id="lx-upload-note-2" class="muted" style="font-size: 12px; font-weight: normal;"></span>
+              </span>
+              <div class="btn-row">
+                <input class="input grow" id="lx-url-2" placeholder="选填，备用源 1 地址 (http/https 或 file://...)">
+                <button class="btn" id="lx-test-2" type="button">测试</button>
+                <button class="btn" id="lx-upload-2" type="button">上传 .js</button>
+                <button class="btn" id="lx-pick-2" type="button" hidden>从 NAS 选择</button>
+              </div>
+              <input type="file" id="lx-file-2" accept=".js" hidden>
+              <div id="lx-report-2" class="report" hidden></div>
+            </div>
+
+            <!-- 槽位 3：备用源 2 -->
+            <div class="field" style="margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 14px;">
+              <span style="font-weight: 600; display: flex; justify-content: space-between;">
+                <span>备用音源 2（备用兜底音源）</span>
+                <span id="lx-upload-note-3" class="muted" style="font-size: 12px; font-weight: normal;"></span>
+              </span>
+              <div class="btn-row">
+                <input class="input grow" id="lx-url-3" placeholder="选填，备用源 2 地址 (http/https 或 file://...)">
+                <button class="btn" id="lx-test-3" type="button">测试</button>
+                <button class="btn" id="lx-upload-3" type="button">上传 .js</button>
+                <button class="btn" id="lx-pick-3" type="button" hidden>从 NAS 选择</button>
+              </div>
+              <input type="file" id="lx-file-3" accept=".js" hidden>
+              <div id="lx-report-3" class="report" hidden></div>
+            </div>
           </div>
         </div>
 
@@ -278,6 +315,6 @@
 
   <div class="toast" id="toast" hidden></div>
 
-  <script src="/app/fnmusic-ext/static/app.js?v=2.6.3"></script>
+  <script src="/app/fnmusic-ext/static/app.js?v=2.6.3.1"></script>
 </body>
 </html>

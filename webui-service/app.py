@@ -118,7 +118,9 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LX_ENABLED": {"kind": "bool", "default": "false", "group": "provider", "reload": "process", "label": "洛雪自定义源"},
     "FNMUSIC_ONLINE_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 启用平台"},
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
-    "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
+    "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪主音源（首选）"},
+    "LX_SOURCE_URL_2": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪备用源 1（主源失效时自动切换）"},
+    "LX_SOURCE_URL_3": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪备用源 2（备用兜底源）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
@@ -517,27 +519,38 @@ async def api_config_put(body: ConfigBody, request: Request):
     except ValueError as exc:
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
 
-    # lx 换源前置校验：新 URL 必须先通过 lxmusic verify 才写入
-    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
+    # lx 换源前置校验：新配置的 URL 必须先通过 lxmusic verify 才写入
+    lx_slots_config = [
+        ("LX_SOURCE_URL", 0, "主音源"),
+        ("LX_SOURCE_URL_2", 1, "备用源 1"),
+        ("LX_SOURCE_URL_3", 2, "备用源 2"),
+    ]
     after_preview = dict(before)
     after_preview.update(updates)
-    if lx_url_changed and current_provider(after_preview) == "lxmusic":
-        new_url = updates["LX_SOURCE_URL"]
-        client = get_http(request)
-        try:
-            resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
-                                     json={"url": new_url}, timeout=130.0)
-            report = _resp_json(resp)
-        except Exception as exc:  # noqa: BLE001
-            report = {"ok": False, "data": {"message": str(exc)}}
-        if not report.get("ok"):
-            message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
-            return JSONResponse(
-                content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
-            )
-        platforms = (report.get("data") or {}).get("platforms") or []
-        if platforms:
-            updates.setdefault("LX_SOURCES", ",".join(platforms))
+    is_lx = current_provider(after_preview) == "lxmusic"
+    all_platforms: list[str] = []
+
+    for key, slot, label in lx_slots_config:
+        val_changed = updates.get(key) not in (None, before.get(key, ""))
+        new_val = (updates.get(key) if key in updates else before.get(key, "")).strip()
+        if is_lx and val_changed and new_val:
+            client = get_http(request)
+            try:
+                resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
+                                         json={"url": new_val}, timeout=130.0)
+                report = _resp_json(resp)
+            except Exception as exc:  # noqa: BLE001
+                report = {"ok": False, "data": {"message": str(exc)}}
+            if not report.get("ok"):
+                message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
+                return JSONResponse(
+                    content={"ok": False, "error": f"洛雪{label}校验未通过：{message}"}, status_code=400
+                )
+            for p in (report.get("data") or {}).get("platforms") or []:
+                if p not in all_platforms:
+                    all_platforms.append(p)
+    if all_platforms:
+        updates.setdefault("LX_SOURCES", ",".join(all_platforms))
 
     old_provider = current_provider(before)
     changed = write_env(updates)
@@ -551,18 +564,31 @@ async def api_config_put(body: ConfigBody, request: Request):
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, new_provider))
-    # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，必须显式激活）
-    if new_provider == "lxmusic" and lx_url_changed:
+    # lx 换源激活：热切换 SOURCE_MANAGER 各槽位
+    if new_provider == "lxmusic":
         client = get_http(request)
-        try:
-            resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
-                                     json={"url": after["LX_SOURCE_URL"]}, timeout=130.0)
-            payload = _resp_json(resp)
-            ok = resp.status_code == 200 and payload.get("ok", False)
-            err = "" if ok else (payload.get("error") or f"HTTP {resp.status_code}")
-        except Exception as exc:  # noqa: BLE001
-            ok, err = False, str(exc)
-        actions.append({"kind": "lx_activate", "ok": ok, "error": err or ""})
+        for key, slot, label in lx_slots_config:
+            val_changed = updates.get(key) not in (None, before.get(key, ""))
+            if val_changed or (old_provider != "lxmusic" and after.get(key)):
+                slot_url = (after.get(key) or "").strip()
+                if slot_url:
+                    try:
+                        resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
+                                                 json={"url": slot_url, "slot": slot}, timeout=130.0)
+                        payload = _resp_json(resp)
+                        ok = resp.status_code == 200 and payload.get("ok", False)
+                        err = "" if ok else (payload.get("error") or f"HTTP {resp.status_code}")
+                    except Exception as exc:  # noqa: BLE001
+                        ok, err = False, str(exc)
+                    actions.append({"kind": "lx_activate" if slot == 0 else f"lx_activate_slot_{slot}", "slot": slot, "ok": ok, "error": err or ""})
+                elif val_changed and before.get(key):
+                    try:
+                        resp = await client.delete(f"{CONF['lx_url']}/api/v1/source?slot={slot}", timeout=30.0)
+                        ok = resp.status_code == 200
+                        err = ""
+                    except Exception as exc:  # noqa: BLE001
+                        ok, err = False, str(exc)
+                    actions.append({"kind": f"lx_clear_slot_{slot}", "slot": slot, "ok": ok, "error": err or ""})
     elif new_provider == "musicdl" and (
         "FNMUSIC_ONLINE_SOURCES" in changed or "MUSICDL_SOURCES" in changed
     ):
