@@ -122,10 +122,10 @@ CONF = {
     # App 显示下载歌曲封面的唯一途径；封面在音乐落库成功后才处理，不存在
     # 音乐失败、封面先落污染目录的情况
     "auto_cover": os.environ.get("FNMUSIC_AUTO_COVER", "true").lower() in ("true", "1", "yes"),
-    # 自动下载歌词（2.6.0）：默认关；仅边听边存开启时生效——音乐完整落库
+    # 自动下载歌词（2.6.0）：默认开；仅边听边存或后台整轨下载开启时生效——音乐完整落库
     # 成功后才下载同名 .lrc 到歌曲所在目录（飞牛扫描入库即带歌词），音乐
     # 下载失败不产生任何歌词文件，不存在歌词先落污染目录的情况
-    "lyric_auto_dl": os.environ.get("FNMUSIC_LYRIC_AUTO_DL", "false").lower() in ("true", "1", "yes"),
+    "lyric_auto_dl": os.environ.get("FNMUSIC_LYRIC_AUTO_DL", "true").lower() in ("true", "1", "yes"),
     # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
     # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
     "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
@@ -1465,14 +1465,16 @@ def find_lyric_file(guid: str) -> str | None:
 
 
 def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
-    """歌词三档归属（音频到哪，歌词到哪）：已有歌词复用原位；有音频落在音频旁；
-    无音频只落 cache（guid 命名）。绝不把曲库目录当无音频时的兜底——那会制造
+    """歌词三档归属（音频到哪，歌词到哪）：音频在真实曲库时落在音频同级 sidecar；
+    已有歌词复用原位；无音频只落 cache（guid 命名）。绝不把曲库目录当无音频时的兜底——那会制造
     只有歌词没有音频的孤儿 .lrc（曲库在云盘上时还会产生上传流量）。
     """
+    audio = find_cache_file(guid)
+    if audio and not _is_rolling_cache_stem(audio, guid):
+        return os.path.splitext(audio)[0] + ".lrc"
     found = find_lyric_file(guid)
     if found:
         return found
-    audio = find_cache_file(guid)
     if audio:
         return os.path.splitext(audio)[0] + ".lrc"
     return os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
@@ -1494,9 +1496,14 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
     text = (text or "").strip()
     if not text:
         return
-    if text == read_lyric_cache(guid):
-        return
     path = lyric_cache_path(guid, title=title, artist=artist)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read().strip() == text:
+                    return
+        except Exception:
+            pass
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     part_path = f"{path}.{uuid4().hex[:8]}.part"
     try:
@@ -1515,16 +1522,16 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
                 pass
 
 
-def promote_shadow_lyric(guid: str, audio_path: str) -> None:
+def promote_shadow_lyric(guid: str, audio_path: str) -> bool:
     """音频落曲库后，把 cache 里的影子歌词（无音频时代的 guid 命名副本）提升为
     音频旁 sidecar，词曲贴身；曲库已有 sidecar 时不覆盖。跨文件系统时退化为复制。
     """
     dest = os.path.splitext(audio_path)[0] + ".lrc"
-    if os.path.exists(dest):
-        return
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return True
     shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
-    if not os.path.exists(shadow):
-        return
+    if not os.path.exists(shadow) or os.path.getsize(shadow) == 0:
+        return False
     try:
         os.replace(shadow, dest)
     except OSError:
@@ -1533,8 +1540,10 @@ def promote_shadow_lyric(guid: str, audio_path: str) -> None:
             os.remove(shadow)
         except Exception as e:
             logger.warning("shadow lyric promote failed for %s: %s", guid, e)
-            return
+            return False
     adopt_library_perms(dest)
+    remember_media_path(guid, dest)
+    return True
 
 
 async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str) -> dict | None:
@@ -2111,12 +2120,16 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, force_mp3: bool = False) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
     primary = str(CONF.get("lx_quality") or "lossless").strip()
     qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
         qualities.insert(0, primary)
+    if force_mp3:
+        qualities = [q for q in qualities if q not in ("flac", "lossless", "hires", "flac24bit")]
+        if not qualities:
+            qualities = ["high", "standard"]
 
     for q in qualities:
         try:
@@ -3369,7 +3382,7 @@ def _tee_metadata_fallback(
     need_cover = not _cover_url_of(dest_info)
     if not (title and artist and album and not need_cover):
         filled = False
-        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
+        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid), charts.find_track(guid)):
             if not snap:
                 continue
             title, artist, album = _merge_missing_tags(title, artist, album, snap)
@@ -3449,9 +3462,9 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
 
 
 async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | None) -> None:
-    """音乐完整落库成功后补齐歌词（FNMUSIC_LYRIC_AUTO_DL，默认关）。
+    """音乐完整落库成功后补齐歌词（FNMUSIC_LYRIC_AUTO_DL）。
 
-    仅边听边存转正路径调用，且必须排在 _schedule_library_scan 之前——保证
+    仅边听边存转正与后台下载落库路径调用，且必须排在 _schedule_library_scan 之前——保证
     官方扫描入库前 .lrc 已落在音频旁。本地已有歌词（含影子提升产物）零请求；
     缺失时向源站补拉（酷我上游接口已失效返回空即跳过）。下载失败不会走到
     这里，不会产生只有歌词没有音频的孤儿文件。
@@ -3461,7 +3474,11 @@ async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | N
     dest = str((meta or {}).get("dest") or "")
     if not dest or _is_rolling_cache_stem(dest, guid):
         return
-    if find_lyric_file(guid):
+    sidecar = os.path.splitext(dest)[0] + ".lrc"
+    if os.path.exists(sidecar) and os.path.getsize(sidecar) > 0:
+        return
+    if promote_shadow_lyric(guid, dest):
+        logger.info("auto lyric promoted shadow to %s for %s", sidecar, guid)
         return
     try:
         text = await asyncio.wait_for(resolve_online_lyric(request, guid), timeout=10.0)
@@ -3469,6 +3486,14 @@ async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | N
         logger.info("auto lyric fetch failed for %s: %s", guid, type(e).__name__)
         return
     if text:
+        if not (os.path.exists(sidecar) and os.path.getsize(sidecar) > 0):
+            try:
+                with open(sidecar, "w", encoding="utf-8") as f:
+                    f.write(text.strip() + "\n")
+                adopt_library_perms(sidecar)
+                remember_media_path(guid, sidecar)
+            except Exception as e:
+                logger.warning("Failed writing auto lyric to sidecar %s: %s", sidecar, e)
         logger.info("auto lyric saved for %s (%d chars)", guid, len(text))
     else:
         logger.info("auto lyric unavailable for %s (source returned no lyric)", guid)
@@ -3649,6 +3674,23 @@ def stream_tee_response(
             with anyio.CancelScope(shield=True):
                 if tee_active_token:
                     _tee_active_release(guid)
+                if not resume_part and guid in _bind_pending and not find_cache_file(guid):
+                    # 客户端流已中断且没有交接续传，但有在途的绑定意图（如听歌途中点了收藏），必须由后台整轨下载兜底落库
+                    users = _bind_pending.get(guid) or {}
+                    saved_headers = None
+                    for u_intent in users.values():
+                        if u_intent.get("headers"):
+                            saved_headers = u_intent["headers"]
+                            break
+                    if saved_headers is None and scan_headers_factory:
+                        try:
+                            saved_headers = scan_headers_factory()
+                        except Exception:
+                            saved_headers = None
+                    if saved_headers is not None:
+                        task = _full_fetch_tasks.get(guid)
+                        if task is None or task.done():
+                            _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, saved_headers))
                 if info_task and not info_task.done():
                     info_task.cancel()
                     await asyncio.gather(info_task, return_exceptions=True)
@@ -3740,7 +3782,12 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not url:
                     return None
             else:
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+                use_force_mp3 = force_mp3 or _lossless_is_blacklisted(guid)
+                resolved = await resolve_lx_url(
+                    get_lx_client(request.app),
+                    song_id_from_online_guid(guid),
+                    force_mp3=use_force_mp3,
+                )
                 if not resolved:
                     return None
                 url = resolved["url"]
@@ -3748,6 +3795,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 for key, value in (resolved.get("headers") or {}).items():
                     if key.lower() in ("referer", "user-agent"):
                         headers[key] = str(value)
+            if info is None:
+                info = charts.find_track(guid)
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
@@ -3829,10 +3878,9 @@ def _lossless_is_blacklisted(guid: str) -> bool:
 
 
 def _audio_file_ok(path: str) -> bool:
-    """完整音频文件的解码校验：ffmpeg 无任何错误输出才算通过。
+    """完整音频文件的解码校验：ffmpeg 严重解码错误判定失败。
 
-    只对已通过长度校验的完整文件调用——截断的完好文件同样会报解码错误，
-    报错文本无法区分二者，完整性必须由字节数校验先行保证。
+    只对已通过长度校验的完整文件调用。良性 warning 或元数据容错放行。
     ffmpeg 不可用（测试守卫/宿主机缺件）时无从校验，只能放行。
     """
     if not tc.FFMPEG_BIN:
@@ -3842,7 +3890,18 @@ def _audio_file_ok(path: str) -> bool:
             [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-f", "null", "-"],
             capture_output=True, text=True, timeout=300,
         )
-        return r.returncode == 0 and not (r.stderr or "").strip()
+        if r.returncode != 0:
+            return False
+        err = (r.stderr or "").lower()
+        fatal_keywords = (
+            "invalid data found",
+            "header missing",
+            "error while decoding",
+            "corrupt input packet",
+        )
+        if any(kw in err for kw in fatal_keywords):
+            return False
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -3858,8 +3917,10 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bo
     if not CONF.get(gate_key) or find_cache_file(guid):
         return False
     if guid in _tee_active:
-        # tee 流式下载同 guid 进行中：不重复下载，tee 转正/切歌续传路径会调度后续动作
-        return False
+        # 如果是收藏/加歌单触发，但当前没有开启边听边存（即当前 tee 仅仅是写 rolling cache，绝不会转正落库），
+        # 则不能跳过后台下载，必须放行以启动整轨下载落入曲库！
+        if not (gate_key == "fav_auto_bind" and not CONF.get("tee_save_enabled")):
+            return False
     task = _full_fetch_tasks.get(guid)
     if task is not None and not task.done():
         return False
@@ -3904,13 +3965,13 @@ def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
 async def _info_for_background_save(request: Request, guid: str, info: dict | None) -> dict:
     """后台整轨/续传落盘前补齐元数据。
 
-    本地推荐歌单、网易账号歌单、历史/收藏里已有标题就用那份，不再打源站。
+    本地推荐歌单、网易账号歌单、历史/收藏、排行榜里已有标题就用那份，不再打源站。
     都没有时再拉一次歌曲信息（数秒，不占播放起播的 0.75 秒窗口）。
     """
     base = dict(info or {})
     if _tag_fields(base)[0]:
         return base
-    local = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
+    local = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid) or charts.find_track(guid)
     if local and _tag_fields(local)[0]:
         merged = dict(local)
         if base.get("ext"):
@@ -4389,7 +4450,7 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     artist = str((meta or {}).get("artist") or "")
     album = str((meta or {}).get("album") or "")
     if not (title.strip() and artist.strip()):
-        snap = _lookup_online_snapshot(guid)
+        snap = _lookup_online_snapshot(guid) or charts.find_track(guid)
         snap = _snapshot_to_info(snap) if isinstance(snap, dict) and snap else {}
         title = title.strip() or str(snap.get("title") or "")
         artist = artist.strip() or str(snap.get("artist") or "")
@@ -4814,7 +4875,11 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
                 get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
             return (url or None, None)
         if source == "lx":
-            resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+            resolved = await resolve_lx_url(
+                get_lx_client(request.app),
+                song_id_from_online_guid(guid),
+                force_mp3=_lossless_is_blacklisted(guid),
+            )
             if not resolved or not resolved.get("url"):
                 return None, None
             headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()

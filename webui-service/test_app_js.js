@@ -246,11 +246,15 @@ test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", asyn
   assert.strictEqual(els.get("#lyric-auto-dl").checked, true);
   els.get("#lyric-auto-dl").checked = false;
   assert.strictEqual(global.collectConfig().FNMUSIC_LYRIC_AUTO_DL, false);
-  // 缺省/关闭都表现为未勾选（默认关）
+  // 缺省表现为勾选（默认开），显式关闭为未勾选
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LYRIC_AUTO_DL: "false" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: {} });
   await global.loadConfig();
-  assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
+  assert.strictEqual(els.get("#lyric-auto-dl").checked, true);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

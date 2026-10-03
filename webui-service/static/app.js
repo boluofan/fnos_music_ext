@@ -117,7 +117,7 @@ function applyConfigToForm() {
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
-  $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
+  $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL !== "false";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
   $("#tee-dir").value = v.FNMUSIC_TEE_SAVE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";

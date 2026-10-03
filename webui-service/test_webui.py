@@ -188,20 +188,20 @@ def test_put_int_clamps_and_bool_normalizes(env_file):
     assert "FNMUSIC_TEE_CACHE_MAX='100'" in env_file.read_text(encoding="utf-8")
 
 
-def test_lyric_auto_dl_default_false_and_roundtrip(env_file):
-    """自动下载歌词：默认关闭；开启后写回 .env，热重载键无需重启。"""
+def test_lyric_auto_dl_default_true_and_roundtrip(env_file):
+    """自动下载歌词：默认开启；关闭后写回 .env，热重载键无需重启。"""
     with authed_client() as client:
         view = client.get("/api/config")
         assert view.status_code == 200
-        assert view.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "false"
+        assert view.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
         assert view.json()["schema"]["FNMUSIC_LYRIC_AUTO_DL"]["reload"] == "hot"
-        saved = client.put("/api/config", json={"values": {"FNMUSIC_LYRIC_AUTO_DL": True}})
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_LYRIC_AUTO_DL": False}})
         assert saved.status_code == 200
         assert "FNMUSIC_LYRIC_AUTO_DL" in saved.json()["changed"]
-    assert "FNMUSIC_LYRIC_AUTO_DL='true'" in env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_LYRIC_AUTO_DL='false'" in env_file.read_text(encoding="utf-8")
     with authed_client() as client:
         again = client.get("/api/config")
-        assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
+        assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "false"
 
 
 # ------------------------------------------------------------------ 切源动作 ---
