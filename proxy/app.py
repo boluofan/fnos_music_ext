@@ -2390,8 +2390,51 @@ def merge_online_tracks(
 
 
 _FAKE_GUID_REVERSE: dict[str, str] = {}
+_GUID_REGISTRY_PATH = (
+    os.environ.get("FNMUSIC_GUID_REGISTRY", "").strip()
+    or os.path.join(_HOME, "guid_registry.json")
+)
+_GUID_PERSIST_LAST = 0.0
+_GUID_PERSIST_DIRTY = False
 _REGISTRY_WARMED = False
 _ONLINE_ID_RE = re.compile(r"online:[A-Za-z0-9_:\-]+")
+
+
+def _persist_guid_registry(force: bool = False) -> None:
+    global _GUID_PERSIST_LAST, _GUID_PERSIST_DIRTY
+    now = time.time()
+    if not force and now - _GUID_PERSIST_LAST < 3.0:
+        _GUID_PERSIST_DIRTY = True
+        return
+    _GUID_PERSIST_LAST = now
+    _GUID_PERSIST_DIRTY = False
+    try:
+        os.makedirs(os.path.dirname(_GUID_REGISTRY_PATH) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_GUID_REGISTRY_PATH) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(_FAKE_GUID_REVERSE, f, ensure_ascii=False)
+            os.replace(tmp, _GUID_REGISTRY_PATH)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except Exception as e:
+        logger.debug("guid registry persist failed: %s", type(e).__name__)
+
+
+def _load_guid_registry_persisted() -> int:
+    try:
+        if not os.path.exists(_GUID_REGISTRY_PATH):
+            return 0
+        with open(_GUID_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _FAKE_GUID_REVERSE.update({str(k): str(v) for k, v in data.items()})
+            return len(data)
+    except Exception as e:
+        logger.debug("guid registry load failed: %s", e)
+    return 0
 
 
 def fake_official_guid(real_guid: str) -> str:
@@ -2402,7 +2445,9 @@ def fake_official_guid(real_guid: str) -> str:
     客户端自身持有的一致，因此所有下发的在线 id 必须统一伪装成官方形态。
     """
     fake = hashlib.md5(f"fnmusic-ext::{real_guid}".encode()).hexdigest()
-    _FAKE_GUID_REVERSE.setdefault(fake, real_guid)
+    if fake not in _FAKE_GUID_REVERSE:
+        _FAKE_GUID_REVERSE[fake] = real_guid
+        _persist_guid_registry()
     return fake
 
 
@@ -2689,6 +2734,7 @@ def ensure_registry_warm() -> None:
     if _REGISTRY_WARMED:
         return
     _REGISTRY_WARMED = True
+    _load_guid_registry_persisted()
     for directory in (CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites"),
                       CONF.get("plt_dir") or os.path.join(_HOME, "playlist_tracks"),
                       dailyrec.play_history_dir(),
@@ -2721,6 +2767,7 @@ def ensure_registry_warm() -> None:
         _load_album_registry_persisted()
     except Exception as e:
         logger.debug("album registry restore failed: %s", type(e).__name__)
+    _persist_guid_registry(force=True)
 
 
 def resolve_real_guid(candidate: str) -> str:
@@ -2937,6 +2984,7 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
     logger.info("==================================")
 
+    ensure_registry_warm()
     charts.preload_local_caches()
     charts_warmup_task = None
     if _background_jobs_enabled() and CONF.get("charts_enabled", True):
@@ -3943,7 +3991,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                         else:
                             info = dict(kg_meta)
                         _cache_online_track(guid, info)
-                resolved = await resolve_lx_url(
+                lx_coro = resolve_lx_url(
                     get_lx_client(request.app),
                     song_id_from_online_guid(guid),
                     force_mp3=use_force_mp3,
@@ -3953,6 +4001,12 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     album=str((info or {}).get("album") or ""),
                     duration=float((info or {}).get("duration_s") or 0.0),
                 )
+                try:
+                    # 酷狗官方接口已封禁，洛雪音源尝试限时 3.5s，避免卡死整轨下载流程
+                    lx_timeout = 3.5 if guid.startswith("online:lx:kg:") else 22.0
+                    resolved = await asyncio.wait_for(lx_coro, timeout=lx_timeout)
+                except Exception:
+                    resolved = None
                 if not resolved:
                     title = str((info or {}).get("title") or (info or {}).get("name") or "").strip()
                     artist = str((info or {}).get("artist") or "").strip()
@@ -4001,6 +4055,17 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                                             if alt_resolved and alt_resolved.get("url"):
                                                 logger.info("Found lx wy cross-platform fallback for %s -> lx:wy:%s", guid, wy_sid)
                                                 resolved = alt_resolved
+                                        # 若洛雪未解出，尝试网易云官方开放外链直链
+                                        if not resolved:
+                                            outer_url = f"https://music.163.com/song/media/outer/url?id={wy_sid}.mp3"
+                                            try:
+                                                async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as probe_c:
+                                                    pr = await probe_c.get(outer_url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1024"})
+                                                    if pr.status_code in (200, 206) and "audio" in pr.headers.get("content-type", "").lower() and "404" not in str(pr.url):
+                                                        logger.info("Found netease open direct outer stream fallback for %s -> %s", guid, pr.url)
+                                                        resolved = {"url": outer_url, "ext": "mp3"}
+                                            except Exception as outer_err:
+                                                logger.debug("Netease outer url probe failed for %s: %s", guid, outer_err)
                         except Exception as fb_wy_err:
                             logger.info("Direct netease fallback search failed for %s: %s", guid, fb_wy_err)
 
