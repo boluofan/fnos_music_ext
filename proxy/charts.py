@@ -162,27 +162,41 @@ def load_chart_cache(chart_id: str, day: str) -> list[dict] | None:
             _index_tracks(data)
             return data
 
-    # 2. 查本地文件
-    path = _cache_file(chart_id, day)
-    if os.path.exists(path):
+    # 2. 查本地文件（优先查当天文件，无当天文件时查最新历史缓存兜底，绝不丢数据）
+    target_path = _cache_file(chart_id, day)
+    paths_to_try = [target_path]
+    if not os.path.exists(target_path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                tracks = data.get("tracks") or []
-                cov = data.get("cover")
-                if cov:
-                    _CHART_COVERS[chart_id] = str(cov)
-                if tracks:
-                    _MEM_CACHE[chart_id] = (time.time(), tracks)
-                    _index_tracks(tracks)
-                    return tracks
-            elif isinstance(data, list) and data:
-                _MEM_CACHE[chart_id] = (time.time(), data)
-                _index_tracks(data)
-                return data
-        except Exception as e:
-            logger.warning("Failed to load chart cache from %s: %s", path, e)
+            cdir = _cache_dir()
+            prefix = f"{chart_id}_"
+            candidates = sorted(
+                [os.path.join(cdir, fn) for fn in os.listdir(cdir) if fn.startswith(prefix) and fn.endswith(".json")],
+                reverse=True
+            )
+            paths_to_try.extend(candidates)
+        except Exception:
+            pass
+
+    for path in paths_to_try:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    tracks = data.get("tracks") or []
+                    cov = data.get("cover")
+                    if cov:
+                        _CHART_COVERS[chart_id] = str(cov)
+                    if tracks:
+                        _MEM_CACHE[chart_id] = (time.time(), tracks)
+                        _index_tracks(tracks)
+                        return tracks
+                elif isinstance(data, list) and data:
+                    _MEM_CACHE[chart_id] = (time.time(), data)
+                    _index_tracks(data)
+                    return data
+            except Exception as e:
+                logger.warning("Failed to load chart cache from %s: %s", path, e)
     return None
 
 
@@ -457,3 +471,45 @@ def list_enabled_charts(
     if wl:
         res = [c for c in res if c["id"] in wl]
     return res
+
+
+def preload_local_caches() -> int:
+    """服务启动时同步把磁盘上已有的所有榜单缓存读入内存并建立索引，0 毫秒极速恢复。"""
+    loaded = 0
+    day = _today()
+    for cid in list(_CHART_MAP.keys()):
+        try:
+            tracks = load_chart_cache(cid, day)
+            if tracks:
+                loaded += 1
+        except Exception:
+            pass
+    return loaded
+
+
+async def warmup_charts_background(enabled_charts: list[dict[str, Any]], netease_enabled: bool = False) -> None:
+    """后台平滑预热所有榜单数据并落盘，防止冷启动时缓存未命中。"""
+    if not enabled_charts:
+        return
+    day = _today()
+    logger.info("Starting background chart warmup for %d charts", len(enabled_charts))
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            for c in enabled_charts:
+                cid = c.get("id")
+                if not cid:
+                    continue
+                # 若今日缓存已存在且在内存，跳过
+                mem = _MEM_CACHE.get(cid)
+                target_path = _cache_file(cid, day)
+                if mem and os.path.exists(target_path):
+                    continue
+                try:
+                    await get_or_load_chart_tracks(cid, client=client, netease_enabled=netease_enabled)
+                    await asyncio.sleep(0.5)  # 礼貌间隔，防突发网络流量
+                except Exception as e:
+                    logger.debug("Warmup chart %s failed: %s", cid, e)
+        logger.info("Background chart warmup completed")
+    except Exception as e:
+        logger.warning("Background chart warmup failed: %s", e)
+

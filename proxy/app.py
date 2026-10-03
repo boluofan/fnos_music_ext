@@ -1569,13 +1569,11 @@ async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str
 
 
 async def resolve_online_lyric(request: Request, guid: str) -> str:
-    """本地 .lrc 优先；没有再向源站要，拿到就落盘。"""
+    # 检查本地歌词缓存
     cached = read_lyric_cache(guid)
     if cached:
         return cached
 
-    if not _source_enabled(guid):
-        return ""
     src = source_from_online_guid(guid)
 
     # 提取歌曲元数据（曲名、歌手），供搜歌词和打标使用
@@ -1583,7 +1581,22 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
     title = str(meta.get("title") or meta.get("name") or "").strip()
     artist = str(meta.get("artist") or "").strip()
 
-    # 1. 网易云歌曲（无论是 online:netease:... 还是 online:lx:wy:...）
+    # 1. 酷狗歌曲极速官方直下（直接由 KRCS 接口下载原版 LRC，秒级命中）
+    if guid.startswith("online:lx:kg:"):
+        kg_hash = guid.split(":")[-1]
+        kg_meta = await _resolve_kg_hash_meta(kg_hash)
+        if kg_meta:
+            title = kg_meta.get("title") or title
+            artist = kg_meta.get("artist") or artist
+            l_id = kg_meta.get("kg_lyric_id")
+            a_key = kg_meta.get("kg_accesskey")
+            if l_id and a_key:
+                krcs_lyric = await _download_kg_krcs_lyric(l_id, a_key)
+                if krcs_lyric:
+                    write_lyric_cache(guid, krcs_lyric, title=title, artist=artist)
+                    return krcs_lyric
+
+    # 2. 网易云歌曲（无论是 online:netease:... 还是 online:lx:wy:...）
     if src == "netease" or (src == "lx" and guid.startswith("online:lx:wy:")):
         raw_song_id = song_id_from_online_guid(guid)
         song_id = raw_song_id.split(":")[-1]
@@ -1625,12 +1638,8 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
         except Exception as e:
             logger.info("netease public lyric failed for %s: %s", guid, e)
 
-    # 2. 洛雪音源系（酷狗 kg、QQ tx、酷我 kw、咪咕 mg 等）
+    # 3. 洛雪音源系（酷狗 kg 兜底、QQ tx、酷我 kw、咪咕 mg 等）
     if src == "lx":
-        if not title and guid.startswith("online:lx:kg:"):
-            kg_meta = await _resolve_kg_hash_meta(guid.split(":")[-1])
-            title = kg_meta.get("title") or ""
-            artist = kg_meta.get("artist") or ""
         lx_client = get_lx_client(request.app)
         song_id = song_id_from_online_guid(guid)
         try:
@@ -2928,6 +2937,19 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
     logger.info("==================================")
 
+    charts.preload_local_caches()
+    charts_warmup_task = None
+    if _background_jobs_enabled() and CONF.get("charts_enabled", True):
+        charts_list = charts.list_enabled_charts(
+            enable_charts=True,
+            enable_kg=bool(CONF.get("kg_charts", True)),
+            enable_wy=bool(CONF.get("wy_charts", True)),
+            custom_whitelist=CONF.get("enabled_charts"),
+        )
+        charts_warmup_task = asyncio.create_task(
+            charts.warmup_charts_background(charts_list, netease_enabled=bool(CONF.get("netease_enabled")))
+        )
+
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
     env_task = asyncio.create_task(_env_watch_loop()) if (
         _background_jobs_enabled() and CONF.get("env_watch", True)
@@ -2985,6 +3007,9 @@ async def lifespan(fastapi_app: FastAPI):
         if env_task:
             env_task.cancel()
             await asyncio.gather(env_task, return_exceptions=True)
+        if charts_warmup_task:
+            charts_warmup_task.cancel()
+            await asyncio.gather(charts_warmup_task, return_exceptions=True)
         try:
             await tc.shutdown_all()
         except Exception:  # noqa: BLE001
@@ -3910,6 +3935,14 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 use_force_mp3 = force_mp3 or _lossless_is_blacklisted(guid)
                 if info is None:
                     info = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+                if not (info and (info.get("title") or info.get("name"))) and guid.startswith("online:lx:kg:"):
+                    kg_meta = await _resolve_kg_hash_meta(guid.split(":")[-1])
+                    if kg_meta:
+                        if info:
+                            info.update(kg_meta)
+                        else:
+                            info = dict(kg_meta)
+                        _cache_online_track(guid, info)
                 resolved = await resolve_lx_url(
                     get_lx_client(request.app),
                     song_id_from_online_guid(guid),
@@ -6198,35 +6231,58 @@ async def _online_favorite_set(request: Request) -> set[str]:
 
 
 async def _resolve_kg_hash_meta(hash_val: str) -> dict:
-    """通过酷狗开放 CDN 接口根据 hash 秒级反查歌曲名与歌手"""
+    """通过酷狗官方 KRCS 候选接口根据 hash 秒级反查歌曲名与歌手（经实测极度稳定，同时可下歌词）"""
     if not hash_val:
         return {}
+    clean_hash = hash_val.upper().strip()
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
             r = await client.get(
-                "http://mobilecdn.kugou.com/api/v3/song/info",
-                params={"hash": hash_val},
+                "http://krcs.kugou.com/search",
+                params={"ver": 1, "man": "yes", "client": "mobi", "keyword": "", "duration": "", "hash": clean_hash},
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             if r.status_code == 200:
-                data = (r.json() or {}).get("data") or {}
-                if data:
-                    title = str(data.get("songName") or "").strip()
-                    artist = str(data.get("singerName") or "").strip()
-                    album = str(data.get("album_name") or "").strip()
-                    try:
-                        duration = int(data.get("timelength") or data.get("duration") or 0) / 1000.0
-                    except (TypeError, ValueError):
-                        duration = 0.0
+                res = r.json() or {}
+                cands = res.get("candidates") or []
+                if cands and isinstance(cands[0], dict):
+                    c0 = cands[0]
+                    title = str(c0.get("song") or "").strip()
+                    artist = str(c0.get("singer") or "").strip()
+                    lyric_id = str(c0.get("id") or "").strip()
+                    access_key = str(c0.get("accesskey") or "").strip()
                     return {
                         "title": title,
                         "artist": artist,
-                        "album": album,
-                        "duration_s": duration,
+                        "album": "",
+                        "duration_s": 0.0,
+                        "kg_lyric_id": lyric_id,
+                        "kg_accesskey": access_key,
                     }
     except Exception as e:
-        logger.debug("kg hash meta resolve failed for %s: %s", hash_val, e)
+        logger.debug("kg krcs hash meta resolve failed for %s: %s", hash_val, e)
     return {}
+
+
+async def _download_kg_krcs_lyric(lyric_id: str, access_key: str) -> str:
+    """通过酷狗官方 KRCS 下载接口获取解码后的 LRC 歌词"""
+    if not lyric_id or not access_key:
+        return ""
+    try:
+        import base64
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(
+                "http://krcs.kugou.com/download",
+                params={"ver": 1, "client": "mobi", "id": lyric_id, "accesskey": access_key, "fmt": "lrc", "charset": "utf8"},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                content_b64 = (r.json() or {}).get("content")
+                if content_b64:
+                    return base64.b64decode(content_b64).decode("utf-8", errors="ignore").strip()
+    except Exception as e:
+        logger.debug("kg krcs lyric download failed: %s", e)
+    return ""
 
 
 async def _best_effort_online_info(request: Request, guid: str) -> dict:
@@ -6248,6 +6304,16 @@ async def _best_effort_online_info(request: Request, guid: str) -> dict:
             artist = kg_meta.get("artist") or artist
             album = kg_meta.get("album") or album
             duration_s = kg_meta.get("duration_s") or duration_s
+            l_id = kg_meta.get("kg_lyric_id")
+            a_key = kg_meta.get("kg_accesskey")
+            if l_id and a_key and not cached_lyric:
+                try:
+                    krcs_lrc = await _download_kg_krcs_lyric(l_id, a_key)
+                    if krcs_lrc:
+                        cached_lyric = krcs_lrc
+                        write_lyric_cache(guid, krcs_lrc, title=title, artist=artist)
+                except Exception:
+                    pass
 
     cached_lyric = read_lyric_cache(guid)
     cached_media = find_cache_file(guid)
