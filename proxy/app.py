@@ -3621,11 +3621,18 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     if tee_enabled:
         title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src)
         dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-        try:
-            shutil.move(part, dest)
-        except Exception as e:
-            logger.error("Failed to move %s to %s: %s", part, dest, e)
-            raise
+        if os.path.exists(dest) and os.path.getsize(dest) >= 1024 and os.path.abspath(dest) != os.path.abspath(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            logger.info("tee finalize: destination already exists and valid, cleaned part and keeping %s", dest)
+        else:
+            try:
+                shutil.move(part, dest)
+            except Exception as e:
+                logger.error("Failed to move %s to %s: %s", part, dest, e)
+                raise
         remember_media_path(guid, dest)
         try:
             adopt_library_perms(dest)
@@ -4242,11 +4249,8 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bo
     """后台整轨下载通用注册逻辑，按 gate_key 指定的 CONF 键做门禁。"""
     if not CONF.get(gate_key) or find_cache_file(guid):
         return False
-    if guid in _tee_active:
-        # 如果是收藏/加歌单触发，但当前没有开启边听边存（即当前 tee 仅仅是写 rolling cache，绝不会转正落库），
-        # 则不能跳过后台下载，必须放行以启动整轨下载落入曲库！
-        if not (gate_key == "fav_auto_bind" and not CONF.get("tee_save_enabled")):
-            return False
+    if guid in _tee_active and gate_key != "fav_auto_bind":
+        return False
     task = _full_fetch_tasks.get(guid)
     if task is not None and not task.done():
         return False
