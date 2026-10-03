@@ -91,7 +91,11 @@ rsync -a --delete \
 # 应用骨架。fnpack 要求 manifest 版本为 x.y.z[-r]（r 为整数修订号）；自动
 # 迭代测试构建在 VERSION/文件名上带字母后缀（如 2.2.9a），manifest 只落基础
 # 三段版本。
-MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+if [[ "${VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)$ ]]; then
+    MANIFEST_VER="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+else
+    MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+fi
 sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/"
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
