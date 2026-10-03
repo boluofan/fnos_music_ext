@@ -237,55 +237,75 @@ def get_chart_cover(chart_id: str) -> str:
 
 
 async def fetch_kg_chart(client: httpx.AsyncClient, rankid: int, limit: int = 100) -> tuple[list[dict], str]:
-    """拉取酷狗音乐排行榜单歌曲与封面"""
+    """拉取酷狗音乐排行榜单歌曲与封面（自动分页拼接，最多 limit 首，默认 100 首）"""
     url = "http://m.kugou.com/rank/info/"
-    params = {"rankid": rankid, "page": 1, "json": "true"}
     headers = {"User-Agent": DEFAULT_UA_MOBILE}
-    try:
-        r = await client.get(url, params=params, headers=headers, timeout=10.0)
-        r.raise_for_status()
-        res = r.json() or {}
-        rows = (res.get("songs") or {}).get("list") or []
-        info = res.get("info") or {}
-        cover_url = str(info.get("banner_9") or info.get("banner_7") or info.get("imgurl") or "").replace("{size}", "400")
-    except Exception as e:
-        logger.warning("kg rank %s fetch failed: %s", rankid, e)
-        return [], ""
-
     tracks: list[dict] = []
-    for it in rows:
-        if not isinstance(it, dict):
-            continue
-        fhash = str(it.get("hash") or "")
-        if not fhash:
-            continue
-        authors = it.get("authors") or []
-        singer = " / ".join(
-            str(a.get("author_name") or "")
-            for a in authors
-            if isinstance(a, dict) and a.get("author_name")
-        )
-        title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "").strip()
-        if not title:
-            continue
-        cover = str(it.get("album_sizable_cover") or "").replace("{size}", "480")
-        tracks.append({
-            "id": f"lx:kg:{fhash}",
-            "source": "lx",
-            "title": title,
-            "artist": singer,
-            "album": "",
-            "duration_s": int(it.get("duration") or 0),
-            "cover_url": cover,
-            "ext": "mp3",
-            "hash": fhash,
-            "mixsongid": str(it.get("album_audio_id") or ""),
-        })
-        if len(tracks) >= limit:
+    cover_url = ""
+    seen_hashes: set[str] = set()
+    page = 1
+    max_pages = 5  # 酷狗每页 30 首，4 页可达 120 首，足以满足 100 首需求，5 页作为安全上限
+
+    while len(tracks) < limit and page <= max_pages:
+        params = {"rankid": rankid, "page": page, "json": "true"}
+        try:
+            r = await client.get(url, params=params, headers=headers, timeout=10.0)
+            r.raise_for_status()
+            res = r.json() or {}
+            rows = (res.get("songs") or {}).get("list") or []
+            if not rows:
+                break
+            if not cover_url:
+                info = res.get("info") or {}
+                cover_url = str(
+                    info.get("banner_9") or info.get("banner_7") or info.get("imgurl") or ""
+                ).replace("{size}", "400")
+        except Exception as e:
+            logger.warning("kg rank %s page %d fetch failed: %s", rankid, page, e)
             break
+
+        added_in_page = 0
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            fhash = str(it.get("hash") or "")
+            if not fhash or fhash in seen_hashes:
+                continue
+            seen_hashes.add(fhash)
+            authors = it.get("authors") or []
+            singer = " / ".join(
+                str(a.get("author_name") or "")
+                for a in authors
+                if isinstance(a, dict) and a.get("author_name")
+            )
+            title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "").strip()
+            if not title:
+                continue
+            cover = str(it.get("album_sizable_cover") or "").replace("{size}", "480")
+            tracks.append({
+                "id": f"lx:kg:{fhash}",
+                "source": "lx",
+                "title": title,
+                "artist": singer,
+                "album": "",
+                "duration_s": int(it.get("duration") or 0),
+                "cover_url": cover,
+                "ext": "mp3",
+                "hash": fhash,
+                "mixsongid": str(it.get("album_audio_id") or ""),
+            })
+            added_in_page += 1
+            if len(tracks) >= limit:
+                break
+
+        # 当前页无新增有效歌曲或返回条目不足一页（30首），说明已到底
+        if added_in_page == 0 or len(rows) < 30:
+            break
+        page += 1
+
     if not cover_url and tracks:
         cover_url = tracks[0].get("cover_url") or ""
-    return tracks, cover_url
+    return tracks[:limit], cover_url
 
 
 async def fetch_wy_chart(

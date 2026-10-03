@@ -6943,12 +6943,12 @@ async def playlist_track_list(request: Request):
             size = int(request.query_params.get("size") or 50)
         except (TypeError, ValueError):
             size = 50
-        if size == -1:
-            size = max(len(tracks), 1)
-        if size < 1:
-            size = 50
-        start = (page - 1) * size
-        page_tracks = tracks[start:start + size]
+        # 榜单歌单直接在首屏整页全量交付（最多 100 首），无需下拉翻页
+        if page == 1:
+            page_tracks = tracks
+        else:
+            start = (page - 1) * size
+            page_tracks = tracks[start:start + size] if start < len(tracks) else []
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
