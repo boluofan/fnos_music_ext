@@ -1646,6 +1646,41 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
         except Exception as l_err:
             logger.warning("lx lyric fetch failed for %s: %s", guid, l_err)
 
+        if title:
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as http_client:
+                    kw_q = f"{title} {artist}".strip()
+                    sr = await http_client.post(
+                        "https://music.163.com/api/search/get/web",
+                        data={"s": kw_q, "type": 1, "offset": 0, "limit": 3, "total": "true"},
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Referer": "https://music.163.com/",
+                            "Cookie": "os=pc",
+                        },
+                    )
+                    if sr.status_code == 200:
+                        songs = ((sr.json() or {}).get("result") or {}).get("songs") or []
+                        if songs and isinstance(songs[0], dict) and songs[0].get("id"):
+                            wy_sid = str(songs[0]["id"])
+                            lr2 = await http_client.get(
+                                "https://music.163.com/api/song/lyric",
+                                params={"id": wy_sid, "lv": 1, "tv": -1},
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                    "Referer": "https://music.163.com/",
+                                    "Cookie": "os=pc",
+                                },
+                            )
+                            if lr2.status_code == 200:
+                                lrc_obj = (lr2.json() or {}).get("lrc") or {}
+                                lyric_text = str(lrc_obj.get("lyric") or "").strip()
+                                if lyric_text:
+                                    write_lyric_cache(guid, lyric_text, title=title, artist=artist)
+                                    return lyric_text
+            except Exception as e:
+                logger.debug("public netease lyric search fallback failed for %s: %s", guid, e)
+
     # 3. 回退尝试 _fetch_online_info(..., include_lyric=True)
     try:
         data = await _fetch_online_info(request, guid, include_lyric=True)
@@ -3882,6 +3917,54 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     duration=float((info or {}).get("duration_s") or 0.0),
                 )
                 if not resolved:
+                    title = str((info or {}).get("title") or (info or {}).get("name") or "").strip()
+                    artist = str((info or {}).get("artist") or "").strip()
+                    if title:
+                        query = f"{title} {artist}".strip()
+                        logger.info("lx track %s unresolvable, searching cross-platform fallback for: %s", guid, query)
+                        if bool(CONF.get("netease_enabled")):
+                            try:
+                                mb_client = get_musicbox_client(request.app)
+                                sr = await mb_client.get("/api/v1/search", params={"keyword": query, "limit": 3}, timeout=6.0)
+                                if sr.status_code == 200:
+                                    s_songs = ((sr.json() or {}).get("data") or {}).get("songs") or []
+                                    for s_song in s_songs:
+                                        alt_sid = str(s_song.get("id") or "")
+                                        if alt_sid:
+                                            alt_url = await resolve_netease_url(mb_client, alt_sid)
+                                            if alt_url:
+                                                logger.info("Found netease fallback url for %s: %s", guid, alt_sid)
+                                                url = alt_url
+                                                ext = "flac" if str(CONF.get("netease_quality")) in ("lossless", "hires") else "mp3"
+                                                resolved = {"url": url, "ext": ext}
+                                                break
+                            except Exception as fb_e:
+                                logger.info("netease fallback search error for %s: %s", guid, fb_e)
+
+                        if not resolved:
+                            try:
+                                lx_c = get_lx_client(request.app)
+                                lr = await lx_c.get("/api/v1/search", params={"keyword": query, "sources": "wy,tx", "limit": 3}, timeout=8.0)
+                                if lr.status_code == 200:
+                                    s_items = (lr.json() or {}).get("items") or []
+                                    for s_it in s_items:
+                                        alt_id = str(s_it.get("id") or "")
+                                        if alt_id and not alt_id.startswith("lx:kg:"):
+                                            alt_resolved = await resolve_lx_url(
+                                                lx_c,
+                                                alt_id,
+                                                force_mp3=use_force_mp3,
+                                                name=title,
+                                                singer=artist,
+                                            )
+                                            if alt_resolved and alt_resolved.get("url"):
+                                                logger.info("Found lx cross-platform fallback for %s -> %s", guid, alt_id)
+                                                resolved = alt_resolved
+                                                break
+                            except Exception as lx_fb_e:
+                                logger.info("lx fallback search error for %s: %s", guid, lx_fb_e)
+
+                if not resolved:
                     return None
                 url = resolved["url"]
                 ext = resolved.get("ext")
@@ -4018,8 +4101,9 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bo
     if task is not None and not task.done():
         return False
     now = time.monotonic()
-    _prune_full_fetch_state(now)
-    if now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
+    if gate_key == "fav_auto_bind":
+        _full_fetch_failed.pop(guid, None)
+    elif now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
         return False
     headers = copy_incoming_headers(request)
     _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, headers))
