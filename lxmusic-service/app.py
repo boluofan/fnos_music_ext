@@ -806,19 +806,48 @@ async def _fill_script_meta(client: httpx.AsyncClient, src: str, item: dict, ide
                     item["title"] = str(song.get("name") or song.get("title") or "")
                 if not item.get("songmid"):
                     item["songmid"] = str(song.get("mid") or identifier)
-        elif src == "kg" and not str(item.get("album_id") or "").strip():
-            r = await client.get(
-                "http://m.kugou.com/app/i/getSongInfo.php",
-                params={"cmd": "playInfo", "hash": identifier},
-                headers={"User-Agent": UA_MOBILE},
-            )
-            data = r.json() or {}
-            if isinstance(data, dict):
-                album_id = str(data.get("albumid") or data.get("req_albumid") or "").strip()
-                if album_id and album_id not in ("0", "None"):
-                    item["album_id"] = album_id
-                if not item.get("hash"):
-                    item["hash"] = identifier
+        elif src == "kg":
+            if not item.get("hash"):
+                item["hash"] = identifier
+            if not str(item.get("album_id") or "").strip() or not item.get("title"):
+                try:
+                    r = await client.get(
+                        "http://m.kugou.com/app/i/getSongInfo.php",
+                        params={"cmd": "playInfo", "hash": identifier},
+                        headers={"User-Agent": UA_MOBILE},
+                    )
+                    data = r.json() or {}
+                    if isinstance(data, dict):
+                        album_id = str(data.get("albumid") or data.get("req_albumid") or "").strip()
+                        if album_id and album_id not in ("0", "None"):
+                            item["album_id"] = album_id
+                        s_name = str(data.get("songName") or "").strip()
+                        if s_name and not item.get("title"):
+                            item["title"] = s_name
+                        s_artist = str(data.get("singerName") or "").strip()
+                        if s_artist and not item.get("artist"):
+                            item["artist"] = s_artist
+                except Exception:
+                    pass
+                if not item.get("title") or not str(item.get("album_id") or "").strip():
+                    try:
+                        r2 = await client.get(
+                            "http://mobilecdn.kugou.com/api/v3/song/info",
+                            params={"hash": identifier},
+                            headers={"User-Agent": UA_MOBILE},
+                        )
+                        d2 = r2.json() or {}
+                        if isinstance(d2, dict) and d2.get("data"):
+                            info2 = d2.get("data") or {}
+                            if not item.get("title"):
+                                item["title"] = str(info2.get("songName") or "")
+                            if not item.get("artist"):
+                                item["artist"] = str(info2.get("singerName") or "")
+                            album_id = str(info2.get("album_id") or "").strip()
+                            if album_id and album_id not in ("0", "None"):
+                                item["album_id"] = album_id
+                    except Exception:
+                        pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("lx meta fill %s %s failed: %s", src, identifier, exc)
 
@@ -903,6 +932,42 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
             break
         else:
             logger.info("lx resolve on slot %d failed for %s:%s, trying next candidate source...", slot, src, identifier)
+
+    if not best:
+        # 智能跨平台搜源兜底（例如酷狗 kg、酷我 kw 原生解析失败时，用歌名和歌手自动在网易/QQ/咪咕等平台寻找同名直链）
+        title = str(item.get("title") or "").strip()
+        artist = str(item.get("artist") or "").strip()
+        if title and not item.get("_cross_fallback"):
+            fallback_platforms = [p for p in ("wy", "tx", "kw", "mg") if p != src]
+            for fb_platform in fallback_platforms:
+                try:
+                    fb_candidates = [(s, r) for s, r in current_runtimes() if fb_platform in r.platforms]
+                    if not fb_candidates:
+                        continue
+                    query = f"{title} {artist}".strip() if artist else title
+                    matched_items = []
+                    if fb_platform == "wy":
+                        matched_items = await wy_search(client, query, limit=3)
+                    elif fb_platform == "tx":
+                        matched_items = await tx_search(client, query, limit=3)
+                    elif fb_platform == "kw":
+                        matched_items = await kw_search(client, query, limit=3)
+                    elif fb_platform == "mg":
+                        matched_items = await mg_search(client, query, limit=3)
+
+                    for cand in matched_items:
+                        cand_title = str(cand.get("title") or "").lower().strip()
+                        if title.lower() in cand_title or cand_title in title.lower():
+                            cand["_cross_fallback"] = True
+                            fb_res = await _resolve_and_probe(client, fb_platform, cand, tier=tier, retained=retained)
+                            if fb_res:
+                                logger.info("Cross-platform fallback succeeded: %s -> %s for %s - %s", src, fb_platform, title, artist)
+                                best = fb_res
+                                break
+                    if best:
+                        break
+                except Exception as fb_err:
+                    logger.debug("Cross-platform fallback error %s -> %s: %s", src, fb_platform, fb_err)
 
     if best:
         best["attempted_tiers"] = attempted
@@ -1698,6 +1763,10 @@ async def track_url(
     id: str = Query("", alias="id"),
     guid: str = Query("", alias="guid"),
     quality: str = Query("lossless"),
+    name: str = Query("", alias="name"),
+    singer: str = Query("", alias="singer"),
+    album: str = Query("", alias="album"),
+    duration: float = Query(0.0, alias="duration"),
 ):
     track_id = (id or guid or "").strip()
     src, identifier = parse_track_id(track_id)
@@ -1706,6 +1775,15 @@ async def track_url(
     _STATS["url_resolutions"] += 1
     canonical_id = f"lx:{src}:{identifier}"
     cached = _cache_get(canonical_id) or {"id": canonical_id, "lx_source": src}
+    if name and not cached.get("title"):
+        cached["title"] = name
+    if singer and not cached.get("artist"):
+        cached["artist"] = singer
+    if album and not cached.get("album"):
+        cached["album"] = album
+    if duration > 0 and not cached.get("duration_s"):
+        cached["duration_s"] = duration
+    _cache_put(cached)
     client = get_http(app)
     try:
         result = await resolve_and_probe(
@@ -1734,25 +1812,37 @@ async def track_info(id: str = Query("", alias="id"), guid: str = Query("", alia
 
 
 @app.get("/api/v1/track/lyric")
-async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", alias="guid")):
+async def track_lyric(
+    id: str = Query("", alias="id"),
+    guid: str = Query("", alias="guid"),
+    name: str = Query("", alias="name"),
+    singer: str = Query("", alias="singer"),
+):
     track_id = (id or guid or "").strip()
     src, identifier = parse_track_id(track_id)
     if not src:
         return _err(f"invalid track id: {track_id}", 400)
     cached = _cache_get(f"lx:{src}:{identifier}") or {}
+    item = dict(cached)
+    if name and not item.get("title"):
+        item["title"] = name
+    if singer and not item.get("artist"):
+        item["artist"] = singer
+    if not item.get("hash") and src == "kg":
+        item["hash"] = identifier
     client = get_http(app)
     text = ""
     try:
         if src == "kg":
-            text = await kg_resolve_lyric(client, cached or {"hash": identifier, "title": "", "artist": "", "duration_s": 0})
+            text = await kg_resolve_lyric(client, item)
         elif src == "wy":
             text = await wy_resolve_lyric(client, identifier)
         elif src == "mg":
-            text = await mg_resolve_lyric(client, cached)
+            text = await mg_resolve_lyric(client, item)
         elif src == "tx":
             text = await tx_resolve_lyric(client, identifier)
         elif src == "kw":
-            text = await kw_resolve_lyric(client, cached or {})
+            text = await kw_resolve_lyric(client, item)
     except Exception as e:  # noqa: BLE001
         logger.warning("lx lyric %s failed: %s", track_id, e)
     return {"ok": True, "data": {"id": track_id, "lyric": text or ""}}

@@ -1577,41 +1577,91 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
     if not _source_enabled(guid):
         return ""
     src = source_from_online_guid(guid)
-    if src == "netease":
-        musicbox_client = get_musicbox_client(request.app)
+
+    # 提取歌曲元数据（曲名、歌手），供搜歌词和打标使用
+    meta = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid) or {}
+    title = str(meta.get("title") or meta.get("name") or "").strip()
+    artist = str(meta.get("artist") or "").strip()
+
+    # 1. 网易云歌曲（无论是 online:netease:... 还是 online:lx:wy:...）
+    if src == "netease" or (src == "lx" and guid.startswith("online:lx:wy:")):
         raw_song_id = song_id_from_online_guid(guid)
         song_id = raw_song_id.split(":")[-1]
-        try:
-            r = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
-            if r.status_code == 200:
-                res_data = r.json()
-                if isinstance(res_data, dict) and res_data.get("ok") is not False:
-                    l_data = res_data.get("data")
-                    if isinstance(l_data, dict):
-                        lyric_text = str(l_data.get("lyric") or "").strip()
-                        if lyric_text:
-                            info = await _online_info(request, guid)
-                            write_lyric_cache(
-                                guid,
-                                lyric_text,
-                                title=str((info or {}).get("title") or ""),
-                                artist=str((info or {}).get("artist") or ""),
-                            )
-                            return lyric_text
-        except Exception as e:
-            logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
-        return ""
+        # A. 若配置了网易云盒子，优先调内置端点
+        if bool(CONF.get("netease_enabled")):
+            musicbox_client = get_musicbox_client(request.app)
+            try:
+                r = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=8.0)
+                if r.status_code == 200:
+                    res_data = r.json()
+                    if isinstance(res_data, dict) and res_data.get("ok") is not False:
+                        l_data = res_data.get("data")
+                        if isinstance(l_data, dict):
+                            lyric_text = str(l_data.get("lyric") or "").strip()
+                            if lyric_text:
+                                write_lyric_cache(guid, lyric_text, title=title, artist=artist)
+                                return lyric_text
+            except Exception as e:
+                logger.info("musicbox lyric fetch failed for %s: %s", guid, e)
 
-    data = await _online_info(request, guid)
-    text = str((data or {}).get("lyric") or "").strip()
-    if text:
-        write_lyric_cache(
-            guid,
-            text,
-            title=str((data or {}).get("title") or ""),
-            artist=str((data or {}).get("artist") or ""),
-        )
-    return text
+        # B. 网易云原生公开开放歌词接口（无需登录、无需 VIP，全网通用极稳定）
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as http_client:
+                r = await http_client.get(
+                    "https://music.163.com/api/song/lyric",
+                    params={"id": song_id, "lv": 1, "tv": -1},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Referer": "https://music.163.com/",
+                        "Cookie": "os=pc",
+                    },
+                )
+                if r.status_code == 200:
+                    lrc_obj = (r.json() or {}).get("lrc") or {}
+                    lyric_text = str(lrc_obj.get("lyric") or "").strip()
+                    if lyric_text:
+                        write_lyric_cache(guid, lyric_text, title=title, artist=artist)
+                        return lyric_text
+        except Exception as e:
+            logger.info("netease public lyric failed for %s: %s", guid, e)
+
+    # 2. 洛雪音源系（酷狗 kg、QQ tx、酷我 kw、咪咕 mg 等）
+    if src == "lx":
+        lx_client = get_lx_client(request.app)
+        song_id = song_id_from_online_guid(guid)
+        try:
+            params = {"id": song_id}
+            if title:
+                params["name"] = title
+            if artist:
+                params["singer"] = artist
+            lr = await lx_client.get("/api/v1/track/lyric", params=params, timeout=10.0)
+            if lr.status_code == 200:
+                l_res = lr.json()
+                if isinstance(l_res, dict) and l_res.get("ok") is not False:
+                    lyric_text = str((l_res.get("data") or {}).get("lyric") or "").strip()
+                    if lyric_text:
+                        write_lyric_cache(guid, lyric_text, title=title, artist=artist)
+                        return lyric_text
+        except Exception as l_err:
+            logger.warning("lx lyric fetch failed for %s: %s", guid, l_err)
+
+    # 3. 回退尝试 _fetch_online_info(..., include_lyric=True)
+    try:
+        data = await _fetch_online_info(request, guid, include_lyric=True)
+        text = str((data or {}).get("lyric") or "").strip()
+        if text:
+            write_lyric_cache(
+                guid,
+                text,
+                title=title or str((data or {}).get("title") or ""),
+                artist=artist or str((data or {}).get("artist") or ""),
+            )
+            return text
+    except Exception:
+        pass
+
+    return ""
 
 
 def media_type_for_ext(ext: str) -> str:
@@ -2120,8 +2170,33 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, force_mp3: bool = False) -> "dict | None":
+async def resolve_lx_url(
+    client: httpx.AsyncClient,
+    song_id: str,
+    force_mp3: bool = False,
+    name: str = "",
+    singer: str = "",
+    album: str = "",
+    duration: float = 0.0,
+    guid: str = "",
+) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
+    # 自动从榜单或曲目缓存中补全歌曲名与歌手，供洛雪脚本正常传参及跨源兜底
+    if not name or not singer:
+        lookup_guid = guid or (f"online:{song_id}" if song_id.startswith("lx:") else f"online:lx:{song_id}")
+        meta = _ONLINE_TRACK_CACHE.get(lookup_guid) or charts.find_track(lookup_guid) or {}
+        if not name:
+            name = str(meta.get("title") or meta.get("name") or "").strip()
+        if not singer:
+            singer = str(meta.get("artist") or "").strip()
+        if not album:
+            album = str(meta.get("album") or "").strip()
+        if duration <= 0:
+            try:
+                duration = float(meta.get("duration_s") or 0.0)
+            except (TypeError, ValueError):
+                duration = 0.0
+
     primary = str(CONF.get("lx_quality") or "lossless").strip()
     qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2133,9 +2208,18 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, force_mp3: boo
 
     for q in qualities:
         try:
+            params = {"id": song_id, "quality": q}
+            if name:
+                params["name"] = name
+            if singer:
+                params["singer"] = singer
+            if album:
+                params["album"] = album
+            if duration > 0:
+                params["duration"] = str(duration)
             r = await client.get(
                 "/api/v1/track/url",
-                params={"id": song_id, "quality": q},
+                params=params,
                 # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 20s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
                 timeout=22.0,
@@ -3480,11 +3564,13 @@ async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | N
     if promote_shadow_lyric(guid, dest):
         logger.info("auto lyric promoted shadow to %s for %s", sidecar, guid)
         return
-    try:
-        text = await asyncio.wait_for(resolve_online_lyric(request, guid), timeout=10.0)
-    except Exception as e:
-        logger.info("auto lyric fetch failed for %s: %s", guid, type(e).__name__)
-        return
+    text = str((meta or {}).get("lyric") or "").strip()
+    if not text:
+        try:
+            text = await asyncio.wait_for(resolve_online_lyric(request, guid), timeout=12.0)
+        except Exception as e:
+            logger.info("auto lyric fetch failed for %s: %s", guid, type(e).__name__)
+            return
     if text:
         if not (os.path.exists(sidecar) and os.path.getsize(sidecar) > 0):
             try:
@@ -3783,10 +3869,17 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     return None
             else:
                 use_force_mp3 = force_mp3 or _lossless_is_blacklisted(guid)
+                if info is None:
+                    info = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
                 resolved = await resolve_lx_url(
                     get_lx_client(request.app),
                     song_id_from_online_guid(guid),
                     force_mp3=use_force_mp3,
+                    guid=guid,
+                    name=str((info or {}).get("title") or (info or {}).get("name") or ""),
+                    singer=str((info or {}).get("artist") or ""),
+                    album=str((info or {}).get("album") or ""),
+                    duration=float((info or {}).get("duration_s") or 0.0),
                 )
                 if not resolved:
                     return None
@@ -4879,6 +4972,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
                 get_lx_client(request.app),
                 song_id_from_online_guid(guid),
                 force_mp3=_lossless_is_blacklisted(guid),
+                guid=guid,
             )
             if not resolved or not resolved.get("url"):
                 return None, None
@@ -5231,6 +5325,14 @@ async def dl_transcode_delete(request: Request):
 async def _online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
     cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
     if cached_t:
+        if include_lyric and not (cached_t.get("lyric") or "").strip():
+            cached_lyric = read_lyric_cache(guid)
+            if not cached_lyric:
+                cached_lyric = await resolve_online_lyric(request, guid)
+            if cached_lyric:
+                cached_t = dict(cached_t)
+                cached_t["lyric"] = cached_lyric
+                _cache_online_track(guid, cached_t)
         return cached_t
     retained, entry = _retained_track(request, guid)
     if not _source_enabled(guid):

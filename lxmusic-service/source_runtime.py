@@ -268,8 +268,16 @@ def build_music_info(item: dict, platform: str) -> dict:
     }.get(platform)
     if platform_key and platform_key[1]:
         info[platform_key[0]] = str(platform_key[1])
-    if platform == "kg" and item.get("hash"):
-        info["songmid"] = str(item["hash"])  # 部分脚本读 songmid
+    if platform == "kg":
+        kg_hash = str(item.get("hash") or identifier or "")
+        if kg_hash:
+            info["hash"] = kg_hash
+            info["songmid"] = kg_hash
+            info["id"] = kg_hash
+        audio_id = str(item.get("mixsongid") or item.get("audio_id") or item.get("album_audio_id") or "").strip()
+        if audio_id and audio_id not in ("0", "None"):
+            info["audio_id"] = audio_id
+            info["album_audio_id"] = audio_id
     # 社区源（六音酷狗、全豆要 QQ）按官方 musicInfo 读这些别名。
     # QQ 的 songmid 与 file.media_mid 经常不是同一个值，不能互相顶替。
     info["id"] = info.get("songmid") or identifier
