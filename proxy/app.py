@@ -1627,6 +1627,10 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
 
     # 2. 洛雪音源系（酷狗 kg、QQ tx、酷我 kw、咪咕 mg 等）
     if src == "lx":
+        if not title and guid.startswith("online:lx:kg:"):
+            kg_meta = await _resolve_kg_hash_meta(guid.split(":")[-1])
+            title = kg_meta.get("title") or ""
+            artist = kg_meta.get("artist") or ""
         lx_client = get_lx_client(request.app)
         song_id = song_id_from_online_guid(guid)
         try:
@@ -3919,50 +3923,88 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not resolved:
                     title = str((info or {}).get("title") or (info or {}).get("name") or "").strip()
                     artist = str((info or {}).get("artist") or "").strip()
+                    if not title and guid.startswith("online:lx:kg:"):
+                        kg_meta = await _resolve_kg_hash_meta(guid.split(":")[-1])
+                        title = kg_meta.get("title") or ""
+                        artist = kg_meta.get("artist") or ""
+                        if info:
+                            info.update(kg_meta)
+                        else:
+                            info = kg_meta
                     if title:
                         query = f"{title} {artist}".strip()
                         logger.info("lx track %s unresolvable, searching cross-platform fallback for: %s", guid, query)
-                        if bool(CONF.get("netease_enabled")):
-                            try:
-                                mb_client = get_musicbox_client(request.app)
-                                sr = await mb_client.get("/api/v1/search", params={"keyword": query, "limit": 3}, timeout=6.0)
+                        # A. 优先直接使用网易云开放搜索接口取歌曲 ID
+                        try:
+                            async with httpx.AsyncClient(timeout=5.0) as http_client:
+                                sr = await http_client.post(
+                                    "https://music.163.com/api/search/get/web",
+                                    data={"s": query, "type": 1, "offset": 0, "limit": 3, "total": "true"},
+                                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/", "Cookie": "os=pc"},
+                                )
                                 if sr.status_code == 200:
-                                    s_songs = ((sr.json() or {}).get("data") or {}).get("songs") or []
-                                    for s_song in s_songs:
-                                        alt_sid = str(s_song.get("id") or "")
-                                        if alt_sid:
-                                            alt_url = await resolve_netease_url(mb_client, alt_sid)
+                                    s_songs = ((sr.json() or {}).get("result") or {}).get("songs") or []
+                                    if s_songs and isinstance(s_songs[0], dict) and s_songs[0].get("id"):
+                                        wy_sid = str(s_songs[0]["id"])
+                                        # 若开启了网易盒子，优先走盒子端点
+                                        if bool(CONF.get("netease_enabled")):
+                                            mb_client = get_musicbox_client(request.app)
+                                            alt_url = await resolve_netease_url(mb_client, wy_sid)
                                             if alt_url:
-                                                logger.info("Found netease fallback url for %s: %s", guid, alt_sid)
+                                                logger.info("Found netease box fallback url for %s: %s", guid, wy_sid)
                                                 url = alt_url
                                                 ext = "flac" if str(CONF.get("netease_quality")) in ("lossless", "hires") else "mp3"
                                                 resolved = {"url": url, "ext": ext}
-                                                break
-                            except Exception as fb_e:
-                                logger.info("netease fallback search error for %s: %s", guid, fb_e)
-
-                        if not resolved:
-                            try:
-                                lx_c = get_lx_client(request.app)
-                                lr = await lx_c.get("/api/v1/search", params={"keyword": query, "sources": "wy,tx", "limit": 3}, timeout=8.0)
-                                if lr.status_code == 200:
-                                    s_items = (lr.json() or {}).get("items") or []
-                                    for s_it in s_items:
-                                        alt_id = str(s_it.get("id") or "")
-                                        if alt_id and not alt_id.startswith("lx:kg:"):
+                                        # 若未开盒子或盒子未解出，走洛雪网易源
+                                        if not resolved:
+                                            lx_c = get_lx_client(request.app)
                                             alt_resolved = await resolve_lx_url(
                                                 lx_c,
-                                                alt_id,
+                                                f"lx:wy:{wy_sid}",
                                                 force_mp3=use_force_mp3,
                                                 name=title,
                                                 singer=artist,
                                             )
                                             if alt_resolved and alt_resolved.get("url"):
-                                                logger.info("Found lx cross-platform fallback for %s -> %s", guid, alt_id)
+                                                logger.info("Found lx wy cross-platform fallback for %s -> lx:wy:%s", guid, wy_sid)
                                                 resolved = alt_resolved
-                                                break
-                            except Exception as lx_fb_e:
-                                logger.info("lx fallback search error for %s: %s", guid, lx_fb_e)
+                        except Exception as fb_wy_err:
+                            logger.info("Direct netease fallback search failed for %s: %s", guid, fb_wy_err)
+
+                        # B. 若网易未解出，直接调用 QQ 音乐官方开放搜索取 mid 走洛雪 QQ 源
+                        if not resolved:
+                            try:
+                                async with httpx.AsyncClient(timeout=5.0) as http_client:
+                                    tx_body = {
+                                        "req_1": {
+                                            "method": "DoSearchForQQMusicDesktop",
+                                            "module": "music.search.SearchCgiService",
+                                            "param": {"search_type": 0, "query": query, "page_num": 1, "num_per_page": 3},
+                                        }
+                                    }
+                                    tr = await http_client.post(
+                                        "https://u.y.qq.com/cgi-bin/musicu.fcg",
+                                        json=tx_body,
+                                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://y.qq.com/"},
+                                    )
+                                    if tr.status_code == 200:
+                                        t_data = tr.json() or {}
+                                        t_list = ((((t_data.get("req_1") or {}).get("data") or {}).get("body") or {}).get("song") or {}).get("list") or []
+                                        if t_list and isinstance(t_list[0], dict) and (t_list[0].get("mid") or t_list[0].get("songmid")):
+                                            tx_mid = str(t_list[0].get("mid") or t_list[0].get("songmid"))
+                                            lx_c = get_lx_client(request.app)
+                                            alt_resolved = await resolve_lx_url(
+                                                lx_c,
+                                                f"lx:tx:{tx_mid}",
+                                                force_mp3=use_force_mp3,
+                                                name=title,
+                                                singer=artist,
+                                            )
+                                            if alt_resolved and alt_resolved.get("url"):
+                                                logger.info("Found lx tx cross-platform fallback for %s -> lx:tx:%s", guid, tx_mid)
+                                                resolved = alt_resolved
+                            except Exception as fb_tx_err:
+                                logger.info("Direct tx fallback search failed for %s: %s", guid, fb_tx_err)
 
                 if not resolved:
                     return None
@@ -6155,28 +6197,78 @@ async def _online_favorite_set(request: Request) -> set[str]:
         return set()
 
 
+async def _resolve_kg_hash_meta(hash_val: str) -> dict:
+    """通过酷狗开放 CDN 接口根据 hash 秒级反查歌曲名与歌手"""
+    if not hash_val:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(
+                "http://mobilecdn.kugou.com/api/v3/song/info",
+                params={"hash": hash_val},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                data = (r.json() or {}).get("data") or {}
+                if data:
+                    title = str(data.get("songName") or "").strip()
+                    artist = str(data.get("singerName") or "").strip()
+                    album = str(data.get("album_name") or "").strip()
+                    try:
+                        duration = int(data.get("timelength") or data.get("duration") or 0) / 1000.0
+                    except (TypeError, ValueError):
+                        duration = 0.0
+                    return {
+                        "title": title,
+                        "artist": artist,
+                        "album": album,
+                        "duration_s": duration,
+                    }
+    except Exception as e:
+        logger.debug("kg hash meta resolve failed for %s: %s", hash_val, e)
+    return {}
+
+
 async def _best_effort_online_info(request: Request, guid: str) -> dict:
     """尽力获取在线曲目元数据：拉不到时从缓存反查兜底，绝不为 None（收藏/歌单快照共用）。"""
     info = await _online_info(request, guid)
-    if info:
+    if info and (info.get("title") or info.get("name")):
         return info
+    title = str((info or {}).get("title") or (info or {}).get("name") or "").strip()
+    artist = str((info or {}).get("artist") or "").strip()
+    album = str((info or {}).get("album") or "").strip()
+    duration_s = float((info or {}).get("duration_s") or 0.0)
+
+    # 酷狗曲目特异性保底反查：有 hash 即能查到完整元数据
+    if not title and guid.startswith("online:lx:kg:"):
+        kg_hash = guid.split(":")[-1]
+        kg_meta = await _resolve_kg_hash_meta(kg_hash)
+        if kg_meta:
+            title = kg_meta.get("title") or title
+            artist = kg_meta.get("artist") or artist
+            album = kg_meta.get("album") or album
+            duration_s = kg_meta.get("duration_s") or duration_s
+
     cached_lyric = read_lyric_cache(guid)
-    title = ""
-    artist = ""
     cached_media = find_cache_file(guid)
-    if cached_media:
+    if cached_media and not title:
         base = os.path.splitext(os.path.basename(cached_media))[0]
         if " - " in base:
             artist, title = base.split(" - ", 1)
         else:
             title = base
-    return {
+    res = {
         "id": song_id_from_online_guid(guid),
         "source": source_from_online_guid(guid),
         "title": title,
         "artist": artist,
+        "album": album,
+        "duration_s": duration_s,
         "lyric": cached_lyric,
     }
+    if title:
+        _cache_online_track(guid, res)
+    return res
 
 
 @app.post("/music/api/v1/favorite-track/create")
