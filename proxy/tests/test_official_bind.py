@@ -232,8 +232,8 @@ def test_bind_timeout_keeps_local_mapping(env, monkeypatch):
     assert len(items) == 1 and items[0]["guid"] == FAKE_KUWO1 and items[0]["bind"] == "pending"
 
 
-def test_favorite_during_active_tee_stream_no_duplicate_download(env, monkeypatch):
-    """tee 流式下载同 guid 进行中：收藏只登记意图，不重复注册后台下载。"""
+def test_favorite_during_active_tee_stream_triggers_download(env, monkeypatch):
+    """tee 流式下载同 guid 进行中：用户点击收藏依然无条件立刻触发后台整轨下载。"""
     make_official_db(env["db_path"], with_track=False)
     recorded = []
 
@@ -251,7 +251,7 @@ def test_favorite_during_active_tee_stream_no_duplicate_download(env, monkeypatc
         )
         assert resp.status_code == 200
 
-    assert recorded == []
+    assert recorded == [FAKE_KUWO1]
     intent = appmod._bind_pending.get(FAKE_KUWO1, {}).get("user-a")
     assert intent and intent["fav"] is True
 

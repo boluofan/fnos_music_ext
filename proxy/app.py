@@ -1443,6 +1443,36 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "", direct
     return unique_library_path(lib, library_basename(title, artist), ext)
 
 
+def is_in_library(guid: str) -> str | None:
+    """检查在线歌曲是否已经在真实的曲库目录中完整落盘（排除 cache_dir 临时滚动缓存）。
+
+    返回曲库音频文件绝对路径；若不在曲库中返回 None。
+    """
+    recalled = recalled_media_path(guid)
+    if recalled and os.path.exists(recalled) and os.path.getsize(recalled) >= 1024:
+        if not _is_rolling_cache_stem(recalled, guid):
+            return recalled
+    stem = recalled_media_stem(guid)
+    if stem and not _is_rolling_cache_stem(stem, guid):
+        for ext in CACHE_EXTS:
+            exact = f"{stem}.{ext}"
+            if os.path.exists(exact) and os.path.getsize(exact) >= 1024:
+                return exact
+    safe = cache_safe_guid(guid)
+    explicit = str(CONF.get("tee_save_dir") or "").strip()
+    lib_dirs = [d for d in ([explicit] if explicit else []) + [detect_library_dir()] if d and os.path.isdir(d)]
+    for d in lib_dirs:
+        for ext in CACHE_EXTS:
+            exact = os.path.join(d, f"{safe}.{ext}")
+            if os.path.exists(exact) and os.path.getsize(exact) >= 1024:
+                return exact
+    path = _find_file_by_snapshot_tags(guid)
+    if path and os.path.exists(path) and os.path.getsize(path) >= 1024:
+        if not _is_rolling_cache_stem(path, guid):
+            return path
+    return None
+
+
 def find_lyric_file(guid: str) -> str | None:
     stem = recalled_media_stem(guid)
     if stem:
@@ -2773,21 +2803,26 @@ def ensure_registry_warm() -> None:
 def resolve_real_guid(candidate: str) -> str:
     if not candidate:
         return candidate
-    if candidate in _FAKE_GUID_REVERSE:
-        return _FAKE_GUID_REVERSE[candidate]
-    if candidate.startswith("track_") and len(candidate) > 6:
-        stripped = candidate[6:]
+    raw = str(candidate).strip()
+    if not raw:
+        return raw
+    if raw in _FAKE_GUID_REVERSE:
+        return _FAKE_GUID_REVERSE[raw]
+    low = raw.lower()
+    if low in _FAKE_GUID_REVERSE:
+        return _FAKE_GUID_REVERSE[low]
+    stripped = low[6:] if low.startswith("track_") and len(low) > 6 else low
+    if stripped in _FAKE_GUID_REVERSE:
+        return _FAKE_GUID_REVERSE[stripped]
+    if re.fullmatch(r"[0-9a-f]{32}", stripped):
+        ensure_registry_warm()
         if stripped in _FAKE_GUID_REVERSE:
             return _FAKE_GUID_REVERSE[stripped]
-        if re.fullmatch(r"[0-9a-f]{32}", stripped):
-            ensure_registry_warm()
-            if stripped in _FAKE_GUID_REVERSE:
-                return _FAKE_GUID_REVERSE[stripped]
-    if re.fullmatch(r"[0-9a-f]{32}", candidate or ""):
+    if re.fullmatch(r"[0-9a-f]{32}", low):
         ensure_registry_warm()
-        if candidate in _FAKE_GUID_REVERSE:
-            return _FAKE_GUID_REVERSE[candidate]
-    return candidate
+        if low in _FAKE_GUID_REVERSE:
+            return _FAKE_GUID_REVERSE[low]
+    return raw
 
 
 def disguise_client_json(obj):
@@ -4247,13 +4282,19 @@ def _prune_full_fetch_state(now: float) -> None:
 
 def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bool:
     """后台整轨下载通用注册逻辑，按 gate_key 指定的 CONF 键做门禁。"""
-    if not CONF.get(gate_key) or find_cache_file(guid):
+    if not CONF.get(gate_key):
+        return False
+    # 曲库中已经有完整文件时无需下载
+    if is_in_library(guid):
         return False
     if guid in _tee_active and gate_key != "fav_auto_bind":
         return False
     task = _full_fetch_tasks.get(guid)
     if task is not None and not task.done():
-        return False
+        if gate_key != "fav_auto_bind":
+            return False
+        logger.info("Background full fetch already active for %s on fav_auto_bind", guid)
+        return True
     now = time.monotonic()
     if gate_key == "fav_auto_bind":
         _full_fetch_failed.pop(guid, None)
@@ -4261,6 +4302,7 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bo
         return False
     headers = copy_incoming_headers(request)
     _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, headers))
+    logger.info("Registered background full fetch for %s (gate=%s)", guid, gate_key)
     return True
 
 
@@ -4274,22 +4316,52 @@ def _register_full_fetch(request: Request, guid: str) -> None:
     _register_background_fetch(request, guid, "tee_save_enabled")
 
 
+async def _promote_cached_to_library(request: Request, guid: str, cached_path: str, cred_headers: dict) -> None:
+    """将临时滚动缓存中已有的完整音频文件直接转正提升到曲库，补齐歌词与绑定。"""
+    try:
+        info = await _info_for_background_save(request, guid, None)
+        ext = os.path.splitext(cached_path)[1].lstrip(".") or "mp3"
+        dest_meta = await asyncio.to_thread(_tee_finalize, cached_path, guid, ext, info or {}, True)
+        if dest_meta:
+            logger.info("Promoted rolling cache file to library for favorite %s -> %s", guid, dest_meta.get("dest"))
+            await _auto_lyric_after_finalize(request, guid, dest_meta)
+            _schedule_library_scan(cred_headers)
+            _dispatch_official_binding(guid, cred_headers, dest_meta)
+            return
+    except Exception as e:
+        logger.warning("Failed to promote cached file to library for %s: %s, falling back to full download", guid, e)
+    _register_background_fetch(request, guid, "fav_auto_bind")
+
+
 def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
                            playlist_guid: str | None = None) -> None:
     """收藏/加入歌单的在线歌曲自动绑定本地：登记官方绑定意图并确保整轨下载落库。
 
-    下载不与边听边存重复：tee 正在流式下载或后台任务在途时只登记意图，由对应
-    完成路径（tee 转正 / 后台整轨下载 / 切歌续传）统一调度官方绑定。文件已在
-    库时无需下载，直接尝试官方绑定（官方可能已扫入库）。
+    无论是未播放还是正在播放，只要用户点击收藏，确保整轨落库与歌词配齐。
     """
     if not CONF.get("fav_auto_bind"):
         return
     headers = copy_incoming_headers(request)
     if user_guid:
         _register_bind_intent(guid, user_guid, headers, playlist_guid)
-    if find_cache_file(guid):
-        _dispatch_official_binding(guid, headers, None)
+
+    lib_path = is_in_library(guid)
+    if lib_path:
+        # 文件已在真实曲库中，检查歌词是否齐全，补齐歌词并调度官方绑定
+        if CONF.get("lyric_auto_dl"):
+            stem = os.path.splitext(lib_path)[0]
+            lrc_path = f"{stem}.lrc"
+            if not os.path.exists(lrc_path) or os.path.getsize(lrc_path) == 0:
+                asyncio.create_task(_auto_lyric_after_finalize(request, guid, {"dest": lib_path}))
+        _dispatch_official_binding(guid, headers, {"dest": lib_path})
         return
+
+    # 若临时滚动缓存 cache_dir 中刚好有完整的音频文件，直接提升(promote)转正至曲库！
+    cached = find_cache_file(guid)
+    if cached and os.path.exists(cached) and os.path.getsize(cached) >= 1024:
+        asyncio.create_task(_promote_cached_to_library(request, guid, cached, headers))
+        return
+
     _register_background_fetch(request, guid, "fav_auto_bind")
 
 
@@ -6433,19 +6505,111 @@ async def _best_effort_online_info(request: Request, guid: str) -> dict:
     return res
 
 
-@app.post("/music/api/v1/favorite-track/create")
+async def _extract_candidate_guids_from_request(request: Request) -> list[str]:
+    """多源全景提取请求中的曲目 GUID，兼容 Query、JSON、Form、嵌套对象及大小写十六进制。"""
+    candidates: list[str] = []
+
+    # 1. URL Query 参数
+    for k in ("trackGUID", "trackGuid", "guid", "track_guid", "id", "trackId", "track_id", "songId", "musicId"):
+        val = request.query_params.get(k)
+        if val:
+            candidates.append(str(val).strip())
+
+    # 2. Body 解析 (JSON / Form / Raw)
+    body_dict = {}
+    raw_body = b""
+    try:
+        raw_body = await request.body()
+        if raw_body:
+            try:
+                parsed = json.loads(raw_body.decode("utf-8", errors="ignore"))
+                if isinstance(parsed, dict):
+                    body_dict = parsed
+                elif isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, (str, int)):
+                            candidates.append(str(item).strip())
+                        elif isinstance(item, dict):
+                            for k in ("trackGUID", "trackGuid", "guid", "id", "trackId"):
+                                if item.get(k):
+                                    candidates.append(str(item[k]).strip())
+            except Exception:
+                pass
+
+            if not body_dict:
+                try:
+                    form_data = await request.form()
+                    body_dict = dict(form_data)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    def _harvest_from_dict(d: dict):
+        if not isinstance(d, dict):
+            return
+        for k in ("trackGUID", "trackGuid", "guid", "track_guid", "id", "trackId", "track_id", "songId", "musicId"):
+            v = d.get(k)
+            if v is not None and isinstance(v, (str, int)):
+                candidates.append(str(v).strip())
+        for list_key in ("trackGUIDs", "trackGuids", "guids", "ids", "trackIds"):
+            lst = d.get(list_key)
+            if isinstance(lst, list):
+                for item in lst:
+                    if item is not None and isinstance(item, (str, int)):
+                        candidates.append(str(item).strip())
+        for nested_key in ("track", "item", "data", "payload"):
+            nested = d.get(nested_key)
+            if isinstance(nested, dict):
+                _harvest_from_dict(nested)
+            elif isinstance(nested, list):
+                for item in nested:
+                    if isinstance(item, dict):
+                        _harvest_from_dict(item)
+
+    if body_dict:
+        _harvest_from_dict(body_dict)
+
+    if not candidates and raw_body:
+        text = raw_body.decode("utf-8", errors="ignore")
+        found_online = re.findall(r"online:[a-zA-Z0-9_:-]+", text)
+        candidates.extend(found_online)
+        found_hex = re.findall(r"\b[0-9a-fA-F]{32}\b", text)
+        candidates.extend(found_hex)
+
+    seen = set()
+    res = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            res.append(c)
+    return res
+
+
+@app.api_route("/music/api/v1/favorite-track/create", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/favorite-track/create/", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/favorite/track/create", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/favorite/track/create/", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/track/favorite/create", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/track/favorite/create/", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/favorite-track/add", methods=["GET", "POST", "PUT"])
+@app.api_route("/music/api/v1/favorite-track/add/", methods=["GET", "POST", "PUT"])
 async def favorite_track_create(request: Request):
     upstream_client = get_upstream_client(request.app)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    candidates = await _extract_candidate_guids_from_request(request)
 
-    guid = ""
-    if isinstance(body, dict):
-        guid = resolve_real_guid(str(body.get("trackGUID") or body.get("guid") or "").strip())
+    online_guids: list[str] = []
+    for raw in candidates:
+        resolved = resolve_real_guid(raw)
+        if is_online_guid(resolved) and resolved not in online_guids:
+            online_guids.append(resolved)
 
-    if not is_online_guid(guid):
+    logger.info(
+        "favorite_track_create: path=%s method=%s raw_candidates=%s resolved_online=%s",
+        request.url.path, request.method, candidates, online_guids,
+    )
+
+    if not online_guids:
         return await forward_to_upstream(request, upstream_client)
 
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -6453,68 +6617,76 @@ async def favorite_track_create(request: Request):
         return auth_resp
 
     now = int(time.time())
-    info = await _best_effort_online_info(request, guid)
-    track_obj = build_favorite_track_obj(guid, info, created_at=now)
-
-    saved = False
     autobind = bool(CONF.get("fav_auto_bind"))
-    async with _FAV_LOCK:
-        try:
-            items = load_online_favorites(user_guid)
-            # 查重
-            idx = next((i for i, it in enumerate(items) if it.get("guid") == guid), None)
-            if idx is not None:
-                # 幂等更新（重新收藏视为新操作，官方绑定开关开启时补 pending 标记）
-                items[idx]["track"] = track_obj
-                if autobind:
-                    items[idx]["bind"] = "pending"
-            else:
-                item = {
-                    "guid": guid,
-                    "createdAt": now,
-                    "track": track_obj,
-                }
-                if autobind:
-                    item["bind"] = "pending"
-                items.append(item)
-            save_online_favorites(user_guid, items)
-            saved = True
-        except Exception as e:
-            logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
 
-    if saved:
-        _register_fav_autobind(request, guid, user_guid)
+    for guid in online_guids:
+        info = await _best_effort_online_info(request, guid)
+        track_obj = build_favorite_track_obj(guid, info, created_at=now)
+
+        saved = False
+        async with _FAV_LOCK:
+            try:
+                items = load_online_favorites(user_guid)
+                idx = next((i for i, it in enumerate(items) if it.get("guid") == guid), None)
+                if idx is not None:
+                    items[idx]["track"] = track_obj
+                    if autobind:
+                        items[idx]["bind"] = "pending"
+                else:
+                    item = {
+                        "guid": guid,
+                        "createdAt": now,
+                        "track": track_obj,
+                    }
+                    if autobind:
+                        item["bind"] = "pending"
+                    items.append(item)
+                save_online_favorites(user_guid, items)
+                saved = True
+            except Exception as e:
+                logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
+
+        if saved:
+            _register_fav_autobind(request, guid, user_guid)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
-@app.post("/music/api/v1/favorite-track/delete")
+@app.api_route("/music/api/v1/favorite-track/delete", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/favorite-track/delete/", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/favorite/track/delete", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/favorite/track/delete/", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/track/favorite/delete", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/track/favorite/delete/", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/favorite-track/remove", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/music/api/v1/favorite-track/remove/", methods=["GET", "POST", "PUT", "DELETE"])
 async def favorite_track_delete(request: Request):
     upstream_client = get_upstream_client(request.app)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    candidates = await _extract_candidate_guids_from_request(request)
 
-    guid = ""
-    raw_guid = ""
-    if isinstance(body, dict):
-        raw_guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
-        guid = resolve_real_guid(raw_guid)
+    online_guids: list[str] = []
+    for raw in candidates:
+        resolved = resolve_real_guid(raw)
+        if is_online_guid(resolved) and resolved not in online_guids:
+            online_guids.append(resolved)
 
-    if not is_online_guid(guid):
-        # 官方绑定已完成的歌曲本地映射已删，客户端旧会话可能仍持伪装 id 取消
-        # 收藏：登记命中则翻译成官方 guid 撤销官方收藏；未命中照旧透传官方
-        hit = _lookup_bind_any_user(raw_guid)
-        if hit and hit[2].get("fav"):
-            bound_user, bound_guid, entry = hit
-            ok = await _official_upstream_write(
-                "POST", "/music/api/v1/favorite-track/delete",
-                copy_incoming_headers(request), {"trackGUID": entry["official"]},
-            )
-            if ok:
-                _forget_bind(bound_user, bound_guid, fav=True)
-            return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    logger.info(
+        "favorite_track_delete: path=%s method=%s raw_candidates=%s resolved_online=%s",
+        request.url.path, request.method, candidates, online_guids,
+    )
+
+    if not online_guids:
+        for raw in candidates:
+            hit = _lookup_bind_any_user(raw)
+            if hit and hit[2].get("fav"):
+                bound_user, bound_guid, entry = hit
+                ok = await _official_upstream_write(
+                    "POST", "/music/api/v1/favorite-track/delete",
+                    copy_incoming_headers(request), {"trackGUID": entry["official"]},
+                )
+                if ok:
+                    _forget_bind(bound_user, bound_guid, fav=True)
+                return JSONResponse(content={"code": 0, "msg": "", "data": None})
         return await forward_to_upstream(request, upstream_client)
 
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -6524,19 +6696,19 @@ async def favorite_track_delete(request: Request):
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
-            items = [it for it in items if it.get("guid") != guid]
+            items = [it for it in items if it.get("guid") not in online_guids]
             save_online_favorites(user_guid, items)
         except Exception as e:
             logger.warning("Error deleting from online favorites for user %s: %s", user_guid, e)
 
-    entry = lookup_bind_entry(user_guid, guid)
-    if entry and entry.get("fav"):
-        # 该曲已完成官方绑定（旧会话假 id）：同步撤销官方收藏
-        if await _official_upstream_write(
-            "POST", "/music/api/v1/favorite-track/delete",
-            copy_incoming_headers(request), {"trackGUID": entry["official"]},
-        ):
-            _forget_bind(user_guid, guid, fav=True)
+    for guid in online_guids:
+        entry = lookup_bind_entry(user_guid, guid)
+        if entry and entry.get("fav"):
+            if await _official_upstream_write(
+                "POST", "/music/api/v1/favorite-track/delete",
+                copy_incoming_headers(request), {"trackGUID": entry["official"]},
+            ):
+                _forget_bind(user_guid, guid, fav=True)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
