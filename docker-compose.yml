@@ -31,6 +31,11 @@ services:
     volumes:
       - ./sources-data:/data
       - .:/repo
+      - ./webui-service:/srv/webui-service
+      - ./lxmusic-service:/srv/lxmusic-service
+      - ./musicdl-service:/srv/musicdl-service
+      - ./musicbox-service:/srv/musicbox-service
+      - ./proxy:/srv/proxy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]

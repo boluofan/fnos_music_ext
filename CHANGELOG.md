@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+## [2.6.5] - 2026-10-03
+
+### 修复与优化
+
+- **彻底根治 WebUI 前端与 Docker 容器代码滞后及飞牛桌面端强缓存问题**：
+  1. **宿主机服务代码直接挂载**：在 `docker-compose.yml` 中直接将宿主机解压的 `./webui-service`、`./lxmusic-service`、`./musicbox-service`、`./musicdl-service`、`./proxy` 挂载覆盖容器内部 `/srv/*` 运行目录，不再依赖 Docker 镜像重新 build，宿主机更新解压后容器内代码立即是最新版；
+  2. **飞牛桌面端 iframe 启动 URL 带版本指纹**：修改 `ui/config`，将窗口加载 URL 改为 `/app/fnmusic-ext/?_v=2.6.5`，强力击穿飞牛客户端（Chromium/Electron）按原 URL 匹配的磁盘缓存（Disk Cache）；
+  3. **升级识别与打包规范对齐**：版本正式提升为 `2.6.5`，确保飞牛应用中心 100% 触发完整解压与重启升级；
+  4. **全链路强力防缓存**：配合 `NoCacheMiddleware` 与 `?v=2.6.5` 静态资源指纹，彻底杜绝老旧单源页面残留。
+
 ## [2.6.4] - 2026-10-03
 
 ### 修复与优化
