@@ -101,7 +101,8 @@ CONF = {
 
 ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+repo_static = Path(CONF["repo_dir"]) / "webui-service" / "static"
+STATIC_DIR = repo_static if repo_static.is_dir() else (Path(__file__).resolve().parent / "static")
 
 # 音源进程 ↔ 启用开关（三选一互斥）
 PROVIDERS = {
@@ -814,5 +815,34 @@ class AuthMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+class NoCacheMiddleware:
+    """禁止浏览器和桌面端缓存静态资源与接口，保证升级后界面即时生效。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                raw_headers = list(message.get("headers", []))
+                # 剔除已有的缓存控制头并追加强力防缓存头
+                headers = [
+                    h for h in raw_headers
+                    if h[0].lower() not in (b"cache-control", b"pragma", b"expires")
+                ]
+                headers.append((b"cache-control", b"no-cache, no-store, must-revalidate, max-age=0"))
+                headers.append((b"pragma", b"no-cache"))
+                headers.append((b"expires", b"0"))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 app.add_middleware(AuthMiddleware)
 app.add_middleware(DesktopPrefixMiddleware)
+app.add_middleware(NoCacheMiddleware)

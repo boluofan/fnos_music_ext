@@ -9,6 +9,14 @@ SUP_CONF="${SUPERVISOR_CONF:-/etc/supervisor/supervisord.conf}"
 
 log() { echo "[entrypoint] $*"; }
 
+# 若宿主机挂载了最新 /repo 代码，启动前热同步各服务代码至 /srv，
+# 即使容器沿用旧镜像启动也能秒级加载宿主机最新修复与静态前端
+for svc in webui-service lxmusic-service musicdl-service musicbox-service proxy; do
+    if [ -d "/repo/$svc" ]; then
+        cp -rf "/repo/$svc/." "/srv/$svc/" 2>/dev/null || true
+    fi
+done
+
 export_source_env
 
 supervisord -c "$SUP_CONF" &

@@ -1120,15 +1120,9 @@ install_sources_container() {
         log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
         return 1
     fi
-    # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的
-    # 运行中容器不会重启（切源/升级恢复 .env 后输出仍是 "Container ... Running"）：
-    # 所选音源与旧进程集不一致时，下方 healthz 必然等满超时，先重启对齐再等待。
-    # 同参数幂等重跑（所选服务全部已健康）不重启，保持快速路径；restart 亦会重新
-    # 解析 bind mount，治愈 target 回滚重建目录后容器挂旧 inode 的现场。
-    if env_newer_than_container && ! sources_quick_ready; then
-        log_info "检测到 .env 更新且所选音源未运行，重启容器使音源开关生效..."
-        run_docker restart "${CONTAINER_NAME}" || return 1
-    fi
+    # 重启容器以触发 entrypoint 热同步（/repo -> /srv），确保宿主机最新代码与静态资源即刻生效
+    log_info "重启容器使最新服务代码与静态资源生效..."
+    run_docker restart "${CONTAINER_NAME}" || return 1
     # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）
     local waited=0
     if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
