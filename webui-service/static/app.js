@@ -119,6 +119,7 @@ function applyConfigToForm() {
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL !== "false";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
+  if ($("#filename-format")) $("#filename-format").value = v.FNMUSIC_FILENAME_FORMAT || "title-artist";
   $("#tee-dir").value = v.FNMUSIC_TEE_SAVE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   $("#bind-timeout").value = v.FNMUSIC_OFFICIAL_BIND_TIMEOUT_S || "120";
@@ -152,6 +153,7 @@ function collectConfig() {
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
+    FNMUSIC_FILENAME_FORMAT: ($("#filename-format") ? $("#filename-format").value : "title-artist") || "title-artist",
     FNMUSIC_TEE_SAVE_DIR: $("#tee-dir").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,
@@ -559,8 +561,10 @@ setupLxSlot(2, "#lx-url-3", "#lx-test-3", "#lx-upload-3", "#lx-file-3", "#lx-pic
   if (el) el.addEventListener("input", () => markDirty());
 });
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
-  $(sel).addEventListener("change", () => markDirty()));
+["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#filename-format"].forEach((sel) => {
+  const el = $(sel);
+  if (el) el.addEventListener("change", () => markDirty());
+});
 
 function updateTeeCountLabel() {
   const n = $("#tee-max").value || configValues.FNMUSIC_TEE_CACHE_MAX || "2";

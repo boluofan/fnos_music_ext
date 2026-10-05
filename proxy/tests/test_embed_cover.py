@@ -203,3 +203,20 @@ def test_finalize_real_fetch_via_transport(finalized_env, tmp_path):
     finalized_env.setattr(p, "_COVER_FETCH_TRANSPORT", httpx.MockTransport(handler))
     dest = finalize_mp3(tmp_path, {"title": "晴天", "artist": "周杰伦", "cover_url": "https://img.example.com/a.jpg"})
     assert read_apic(dest).data == JPEG
+
+
+def test_flac_embedded_cover_bytes_and_check(tmp_path, monkeypatch):
+    """测试 FLAC 内嵌封面的识别与提取（Mutagen mf.pictures 兼容）。"""
+    path = make_audio(tmp_path, "sample.flac", "-c:a", "flac")
+    assert p._has_embedded_cover(path) is False
+    assert p.embed_audio_cover(path, PNG, "image/png") is True
+    assert p._has_embedded_cover(path) is True
+
+    guid = "online:test:flac_cover_1"
+    monkeypatch.setattr(p, "find_cache_file", lambda g: path if g == guid else None)
+    res = p._embedded_cover_bytes(guid)
+    assert res is not None
+    data, mime = res
+    assert data == PNG
+    assert mime == "image/png"
+

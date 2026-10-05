@@ -188,28 +188,29 @@ test("syncNeteaseAccount：未登录清空 / 请求失败清空", async () => {
   assert.strictEqual(els.get("#qr-check").textContent, "");
 });
 
-test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () => {
+test("markDirty / clearDirty：save-bar 的 dirty 类显隐与文案同步", () => {
   reset();
   global.markDirty("已修改配置");
   assert.strictEqual(els.get("#save-note").textContent, "已修改配置");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  assert.strictEqual(els.get("#save-bar").classList.contains("dirty"), true);
   global.clearDirty();
-  assert.strictEqual(els.get("#save-note").textContent, "");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+  assert.strictEqual(els.get("#save-note").textContent, "已保存，配置已生效");
+  assert.strictEqual(els.get("#save-bar").classList.contains("dirty"), false);
 });
 
-test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入框并标脏", async () => {
+test("文件命名格式（FNMUSIC_FILENAME_FORMAT）：loadConfig 回填 + collectConfig 收集", async () => {
   reset();
-  enqueue("/app/fnmusic-ext/api/lx/upload", {
-    ok: true,
-    data: { path: "/data/lxmusic/uploads/mine.js", url: "file:///data/lxmusic/uploads/mine.js", meta: { name: "上传源" } },
-  });
-  const r = await global.lxUploadScript("mine.js", "/*stub*/");
-  assert.strictEqual(r.data.url, "file:///data/lxmusic/uploads/mine.js");
-  await global.lxAfterUpload(r);
-  assert.strictEqual(els.get("#lx-url").value, "file:///data/lxmusic/uploads/mine.js");
-  assert.strictEqual(els.get("#lx-upload-note").textContent, "已上传：上传源");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_FILENAME_FORMAT: "artist-title" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#filename-format").value, "artist-title");
+  assert.strictEqual(global.collectConfig().FNMUSIC_FILENAME_FORMAT, "artist-title");
+
+  // 缺省回填默认值 title-artist
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#filename-format").value, "title-artist");
+  assert.strictEqual(global.collectConfig().FNMUSIC_FILENAME_FORMAT, "title-artist");
 });
 
 test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {

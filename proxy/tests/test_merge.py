@@ -65,10 +65,20 @@ def setup_test_env(tmp_path, monkeypatch):
 
 
 def test_library_basename_omits_source_id():
-    assert library_basename("晴天", "周杰伦") == "周杰伦 - 晴天"
-    assert library_basename("不再犹豫", "BEYOND") == "BEYOND - 不再犹豫"
+    # 默认格式 title-artist：歌名在前，歌手在后
+    assert library_basename("晴天", "周杰伦") == "晴天 - 周杰伦"
+    assert library_basename("不再犹豫", "BEYOND") == "不再犹豫 - BEYOND"
     assert library_basename("晴天", "") == "晴天"
     assert "600902" not in library_basename("晴天", "周杰伦")
+
+    # 切换为 artist-title 格式：歌手在前，歌名在后
+    old_fmt = CONF.get("filename_format")
+    try:
+        CONF["filename_format"] = "artist-title"
+        assert library_basename("晴天", "周杰伦") == "周杰伦 - 晴天"
+        assert library_basename("晴天", "") == "晴天"
+    finally:
+        CONF["filename_format"] = old_fmt
 
 
 def test_find_cache_file_legacy_id_name_and_ref(tmp_path):

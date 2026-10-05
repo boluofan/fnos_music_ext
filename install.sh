@@ -953,6 +953,7 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_TEE_SAVE_ENABLED='true'"
     echo "FNMUSIC_TEE_SAVE_DIR=''"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
+    echo "FNMUSIC_FILENAME_FORMAT='title-artist'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
     if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then

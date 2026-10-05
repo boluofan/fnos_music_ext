@@ -276,6 +276,13 @@
             <input class="input" id="tee-dir" placeholder="留空自动探测共享曲库目录">
           </label>
           <p class="hint">留空时自动读取飞牛共享曲库目录；也可填入指定 NAS 绝对路径（如 /vol1/1000/Music）。</p>
+          <label class="field"><span>文件命名格式</span>
+            <select class="input" id="filename-format">
+              <option value="title-artist">歌曲名 - 歌手名（如：男人歌 - 宝石Gem.flac）</option>
+              <option value="artist-title">歌手名 - 歌曲名（如：宝石Gem - 男人歌.flac）</option>
+            </select>
+          </label>
+          <p class="hint">下载与边听边存保存到本地曲库时的文件命名规则。保存后新下载的歌曲按此规则命名。</p>
           <label class="field"><span>曲库重扫接口（选填）</span>
             <input class="input" id="scan-path" placeholder="留空=官方自动扫描入库">
           </label>

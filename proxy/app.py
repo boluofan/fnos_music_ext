@@ -110,6 +110,8 @@ CONF = {
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
+    # 曲库文件名格式：title-artist（默认：歌曲名 - 歌手名）或 artist-title（歌手名 - 歌曲名）
+    "filename_format": os.environ.get("FNMUSIC_FILENAME_FORMAT", "title-artist").strip().lower(),
     # 收藏/加入歌单自动绑定本地：默认关；在线歌曲收藏后后台自动整轨下载并绑定本地文件，
     # 官方曲库收录后再把收藏/歌单写进官方（成功后删本地映射，避免双列表重复显示）
     "fav_auto_bind": os.environ.get("FNMUSIC_FAV_AUTO_BIND", "false").lower() in ("true", "1", "yes"),
@@ -479,6 +481,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
+    "FNMUSIC_FILENAME_FORMAT": ("filename_format", "filename_format"),
     "FNMUSIC_FAV_AUTO_BIND": ("fav_auto_bind", "bool"),
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": ("official_bind_timeout_s", "bind_timeout"),
     "FNMUSIC_TEE_HANDOFF_MAX": ("tee_handoff_max", "tee_handoff_max"),
@@ -533,6 +536,9 @@ def _env_watch_parse(raw: str, kind: str):
             return max(1, min(100, int(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "filename_format":
+        val = raw.lower()
+        return val if val in ("title-artist", "artist-title") else "title-artist"
     if kind == "quality_mode":
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
     if kind == "lx_sources":
@@ -916,10 +922,18 @@ _ONLINE_TRACK_CACHE: dict[str, dict] = {}
 _MAX_ONLINE_TRACK_CACHE = 10000
 
 
+def _cover_url_of(info: dict | None) -> str:
+    src = info if isinstance(info, dict) else {}
+    return str(src.get("cover_url") or src.get("coverUrl") or src.get("coverURL") or "").strip()
+
+
 def _cache_online_track(guid: str, track: dict) -> None:
     """全局内存在线曲目缓存（覆盖排行榜、推荐与搜索曲目），供封面与详情 0ms 命中"""
     if not guid or not isinstance(track, dict):
         return
+    existing = _ONLINE_TRACK_CACHE.get(guid)
+    if existing and not _cover_url_of(track) and _cover_url_of(existing):
+        track = {**track, "cover_url": _cover_url_of(existing), "coverUrl": _cover_url_of(existing)}
     if len(_ONLINE_TRACK_CACHE) > _MAX_ONLINE_TRACK_CACHE:
         for k in list(_ONLINE_TRACK_CACHE.keys())[:2000]:
             _ONLINE_TRACK_CACHE.pop(k, None)
@@ -927,7 +941,7 @@ def _cache_online_track(guid: str, track: dict) -> None:
 
 
 def official_track_meta_by_path(path: str) -> "dict | None":
-    """只读官方 music.db，按落盘物理文件路径反查曲目元数据（title, artist, album, guid）。"""
+    """只读官方 music.db，按落盘物理文件路径反查曲目元数据（title, artist, album, guid, cover_guid）。"""
     path_s = (path or "").strip()
     if not path_s:
         return None
@@ -945,7 +959,7 @@ def official_track_meta_by_path(path: str) -> "dict | None":
         base_name = os.path.basename(path_s)
 
         sql = (
-            "SELECT t.guid, t.title, ar.name, al.name FROM track t "
+            "SELECT t.guid, t.title, ar.name, al.name, t.cover_guid FROM track t "
             "JOIN audio_file a ON a.id = t.audio_file_id "
             "LEFT JOIN album al ON al.id = t.album_id "
             "LEFT JOIN track_artist ta ON ta.track_id = t.id "
@@ -963,6 +977,7 @@ def official_track_meta_by_path(path: str) -> "dict | None":
                         "title": str(row[1] or ""),
                         "artist": str(row[2] or ""),
                         "album": str(row[3] or ""),
+                        "cover_guid": str(row[4] or "") if len(row) > 4 else "",
                     }
             except Exception as e:
                 logger.debug("Official track meta query failed: %s", e)
@@ -970,7 +985,7 @@ def official_track_meta_by_path(path: str) -> "dict | None":
 
         if base_name:
             suffix_sql = (
-                "SELECT t.guid, t.title, ar.name, al.name FROM track t "
+                "SELECT t.guid, t.title, ar.name, al.name, t.cover_guid FROM track t "
                 "JOIN audio_file a ON a.id = t.audio_file_id "
                 "LEFT JOIN album al ON al.id = t.album_id "
                 "LEFT JOIN track_artist ta ON ta.track_id = t.id "
@@ -985,6 +1000,7 @@ def official_track_meta_by_path(path: str) -> "dict | None":
                         "title": str(row[1] or ""),
                         "artist": str(row[2] or ""),
                         "album": str(row[3] or ""),
+                        "cover_guid": str(row[4] or "") if len(row) > 4 else "",
                     }
             except Exception:
                 pass
@@ -1014,7 +1030,8 @@ def build_online_track(item: dict) -> dict:
         file_size = int(file_size or 0)
     except (TypeError, ValueError):
         file_size = 0
-    cover = str(item.get("cover_url") or "")
+    cover = _cover_url_of(item)
+    cover_id = guid
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
 
@@ -1030,18 +1047,19 @@ def build_online_track(item: dict) -> dict:
         except OSError:
             pass
         spec_path = cached
-        # 专辑容错补充：若原信息为未知专辑，官方库已有收录则对齐真实专辑名
-        if album in ("未知专辑", "未知", "unknown album", "unknown", ""):
-            meta = official_track_meta_by_path(cached)
-            if meta and meta.get("album"):
+        meta = official_track_meta_by_path(cached)
+        if meta:
+            if album in ("未知专辑", "未知", "unknown album", "unknown", "") and meta.get("album"):
                 album = meta["album"]
+            if meta.get("cover_guid"):
+                cover_id = meta["cover_guid"]
 
     artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
         "name": album,
         "guid": f"{guid}:album",
         "artists": artists_list,
-        "coverId": guid,
+        "coverId": cover_id,
     }
     # 专辑伪装 guid 同步登记（issue #22）：客户端点击专辑时按 fake 反解分源适配详情
     register_fake_album(guid, album, item)
@@ -1079,7 +1097,7 @@ def build_online_track(item: dict) -> dict:
         "ext": ext,
         "size": file_size,
         "file_size": file_size,
-        "coverId": guid,
+        "coverId": cover_id,
         "cover_url": cover,
         "coverUrl": cover,
         "coverURL": cover,
@@ -1153,11 +1171,14 @@ def safe_basename_title(title: str) -> str:
 
 
 def library_basename(title: str, artist: str = "") -> str:
-    """曲库文件名：歌手 - 歌名（无源站 id）。飞牛无标签时会用文件名当标题。"""
+    """曲库文件名：按 filename_format 决定 歌名 - 歌手 或 歌手 - 歌名。飞牛无标签时会用文件名当标题。"""
     title_s = safe_basename_title(title)
     artist_s = safe_basename_title(artist) if (artist or "").strip() else ""
+    fmt = (CONF.get("filename_format") or "title-artist").strip().lower()
     if artist_s and artist_s.lower() != title_s.lower() and artist_s != "unknown":
-        return f"{artist_s} - {title_s}"
+        if fmt == "artist-title":
+            return f"{artist_s} - {title_s}"
+        return f"{title_s} - {artist_s}"
     return title_s
 
 
@@ -1303,10 +1324,14 @@ def _has_embedded_cover(path: str) -> bool:
         from mutagen import File as MutagenFile
 
         mf = MutagenFile(path)
+        if mf is None:
+            return False
+        if getattr(mf, "pictures", None):  # FLAC
+            return bool(mf.pictures)
         tags = getattr(mf, "tags", None)
         if tags is None:
             return False
-        if hasattr(tags, "pictures"):  # FLAC/APE
+        if hasattr(tags, "pictures"):  # APE
             return bool(tags.pictures)
         if hasattr(tags, "getall"):  # ID3
             return bool(tags.getall("APIC"))
@@ -6240,17 +6265,21 @@ def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
         from mutagen import File as MutagenFile
 
         mf = MutagenFile(path)
-        tags = getattr(mf, "tags", None)
-        if tags is None:
+        if mf is None:
             return None
         pics: list = []
-        if hasattr(tags, "pictures"):  # FLAC/APE
-            pics = list(tags.pictures or [])
-        elif hasattr(tags, "getall"):  # ID3
-            pics = list(tags.getall("APIC") or [])
-        elif hasattr(tags, "get"):
-            covr = tags.get("covr")  # MP4
-            pics = list(covr) if covr else []
+        if getattr(mf, "pictures", None):  # FLAC
+            pics = list(mf.pictures or [])
+        else:
+            tags = getattr(mf, "tags", None)
+            if tags is not None:
+                if hasattr(tags, "pictures"):  # APE
+                    pics = list(tags.pictures or [])
+                elif hasattr(tags, "getall"):  # ID3
+                    pics = list(tags.getall("APIC") or [])
+                elif hasattr(tags, "get"):
+                    covr = tags.get("covr")  # MP4
+                    pics = list(covr) if covr else []
         for pic in pics:
             data = getattr(pic, "data", None)
             if not data:
@@ -6374,17 +6403,37 @@ async def static_cover(request: Request, subpath: str = ""):
     # ① 优先极速查榜单/内存在线曲目直链封面（0ms 响应，无需等待上游查询）
     cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
     if cached_t:
-        cov = str(cached_t.get("cover_url") or cached_t.get("coverUrl") or "")
+        cov = _cover_url_of(cached_t)
+        if cov and _KW_TEXT_COVER_HOST not in cov:
+            return RedirectResponse(cov, status_code=302)
+
+    # ② 优先读取本地已缓存/入库音频文件的内嵌专辑图（0ms 本地磁盘直出，不依赖网络上游）
+    embedded = _embedded_cover_bytes(guid)
+    if embedded:
+        art, mime = embedded
+        return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+
+    # ③ 若本地已有落库文件且官方数据库已扫出真实 cover_guid，重定向给官方返回
+    local_path = find_cache_file(guid)
+    if local_path:
+        meta = official_track_meta_by_path(local_path)
+        if meta and meta.get("cover_guid"):
+            return RedirectResponse(f"/static/cover/{meta['cover_guid']}", status_code=302)
+
+    # ④ 尝试从历史/收藏快照或歌单缓存读取 cover_url（0ms 快速兜底）
+    snap = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
+    if snap:
+        cov = _cover_url_of(snap)
         if cov and _KW_TEXT_COVER_HOST not in cov:
             return RedirectResponse(cov, status_code=302)
 
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
-    # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    # ⑤ 在线信息已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
         return RedirectResponse(cover, status_code=302)
 
-    # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
+    # ⑥ 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
     direct = ""
     kw_rid = _kw_rid_from_guid(guid)
     if kw_rid:
@@ -6394,18 +6443,12 @@ async def static_cover(request: Request, subpath: str = ""):
     if direct:
         return RedirectResponse(direct, status_code=302)
 
-    # ③ 网易 cloudsearch 同名曲补全
+    # ⑦ 网易 cloudsearch 同名曲补全
     enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
         return RedirectResponse(enriched, status_code=302)
 
-    # ④ 本地边听边存文件的内嵌专辑图
-    embedded = _embedded_cover_bytes(guid)
-    if embedded:
-        art, mime = embedded
-        return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
-
-    # ⑤ 本地占位图池：在线曲目封面永不 404
+    # ⑧ 本地占位图池：在线曲目封面永不 404
     return _placeholder_cover_response(guid)
 
 
@@ -6495,8 +6538,11 @@ def _snapshot_to_info(track: dict) -> dict:
     if isinstance(spec, dict):
         info.setdefault("ext", spec.get("format") or "mp3")
         info.setdefault("file_size", spec.get("size") or 0)
-        if not info.get("cover_url"):
-            info["cover_url"] = track.get("coverUrl") or track.get("cover_url") or ""
+    cov = _cover_url_of(track)
+    if cov and not info.get("cover_url"):
+        info["cover_url"] = cov
+    if track.get("coverId") and not info.get("coverId"):
+        info["coverId"] = track["coverId"]
     return info
 
 
@@ -6533,10 +6579,12 @@ def build_favorite_track_obj(
         or "未知专辑"
     )
     # 官方 album 对象没有 artists 键；releaseDate/barcode 缺省为 null 而非 0/""
+    track_cover_id = vo.get("coverId") or guid
+    album_cover_id = (vo.get("album", {}).get("coverId") if isinstance(vo.get("album"), dict) else None) or track_cover_id
     album_obj = {
         "guid": f"{guid}:album",
         "name": album_name,
-        "coverId": guid,
+        "coverId": album_cover_id,
         "releaseDate": None,
         "barcode": None,
         "createdAt": ts,
@@ -6562,7 +6610,9 @@ def build_favorite_track_obj(
         "album": album_obj,
         "audioSpec": audio_spec,
         "accessStatus": 0,
-        "coverId": guid,
+        "coverId": track_cover_id,
+        "cover_url": vo.get("cover_url") or "",
+        "coverUrl": vo.get("coverUrl") or "",
         "year": None,
         "discNo": None,
         "trackNo": None,
@@ -8481,6 +8531,7 @@ async def event_report(request: Request):
                             duration_s = dv / 1000.0 if dv > 10000 else dv
                         except (TypeError, ValueError):
                             duration_s = None
+                    retained = None
                     if not title or not artist or not album:
                         # 事件不带元数据时从内存搜索会话补齐（播放时会话必在）
                         retained, _entry = _retained_track(request, guid)
@@ -8510,6 +8561,20 @@ async def event_report(request: Request):
                             title = title or file_title
                         else:
                             title = title or base
+                    cover_url = _cover_url_of(payload) if isinstance(payload, dict) else ""
+                    if not cover_url:
+                        if retained is None:
+                            retained, _entry = _retained_track(request, guid)
+                        if retained:
+                            cover_url = _cover_url_of(retained)
+                    if not cover_url:
+                        served = _lookup_playlist_cache_track(guid)
+                        if served:
+                            cover_url = _cover_url_of(served)
+                    if not cover_url:
+                        cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+                        if cached_t:
+                            cover_url = _cover_url_of(cached_t)
                     snapshot = {
                         "guid": guid,
                         "title": title,
@@ -8520,6 +8585,8 @@ async def event_report(request: Request):
                         snapshot["album"] = album
                     if duration_s:
                         snapshot["duration_s"] = duration_s
+                    if cover_url:
+                        snapshot["cover_url"] = cover_url
                     dailyrec.record_online_play(user_guid, guid, snapshot)
         elif auth_resp is not None and not other_events:
             return auth_resp
@@ -8594,7 +8661,19 @@ async def play_history_list(request: Request):
                     "album": r_album,
                     "duration_s": retained.get("duration_s") or 0,
                     "ext": retained.get("ext") or "",
+                    "cover_url": _cover_url_of(retained),
                 }
+        if info and not info.get("cover_url"):
+            retained, _entry = _retained_track(request, guid)
+            cov = _cover_url_of(retained) if retained else ""
+            if not cov:
+                served = _lookup_playlist_cache_track(guid)
+                cov = _cover_url_of(served) if served else ""
+            if not cov:
+                cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+                cov = _cover_url_of(cached_t) if cached_t else ""
+            if cov:
+                info["cover_url"] = cov
         obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
         obj["isFavorite"] = guid in fav_set
         online_tracks.append(disguise_client_json(obj))
