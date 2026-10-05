@@ -926,6 +926,73 @@ def _cache_online_track(guid: str, track: dict) -> None:
     _ONLINE_TRACK_CACHE[guid] = track
 
 
+def official_track_meta_by_path(path: str) -> "dict | None":
+    """只读官方 music.db，按落盘物理文件路径反查曲目元数据（title, artist, album, guid）。"""
+    path_s = (path or "").strip()
+    if not path_s:
+        return None
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except Exception as e:
+        logger.warning("Official track meta db open failed: %s", e)
+        return None
+    try:
+        abs_p = os.path.abspath(path_s)
+        real_p = os.path.realpath(path_s)
+        base_name = os.path.basename(path_s)
+
+        sql = (
+            "SELECT t.guid, t.title, ar.name, al.name FROM track t "
+            "JOIN audio_file a ON a.id = t.audio_file_id "
+            "LEFT JOIN album al ON al.id = t.album_id "
+            "LEFT JOIN track_artist ta ON ta.track_id = t.id "
+            "LEFT JOIN artist ar ON ar.id = ta.artist_id "
+            "WHERE a.path = ? ORDER BY t.id DESC LIMIT 1"
+        )
+        for p in dict.fromkeys([path_s, abs_p, real_p]):
+            if not p:
+                continue
+            try:
+                row = con.execute(sql, (p,)).fetchone()
+                if row and row[0]:
+                    return {
+                        "guid": str(row[0]),
+                        "title": str(row[1] or ""),
+                        "artist": str(row[2] or ""),
+                        "album": str(row[3] or ""),
+                    }
+            except Exception as e:
+                logger.debug("Official track meta query failed: %s", e)
+                return None
+
+        if base_name:
+            suffix_sql = (
+                "SELECT t.guid, t.title, ar.name, al.name FROM track t "
+                "JOIN audio_file a ON a.id = t.audio_file_id "
+                "LEFT JOIN album al ON al.id = t.album_id "
+                "LEFT JOIN track_artist ta ON ta.track_id = t.id "
+                "LEFT JOIN artist ar ON ar.id = ta.artist_id "
+                "WHERE a.path LIKE '%' || ? ORDER BY t.id DESC LIMIT 1"
+            )
+            try:
+                row = con.execute(suffix_sql, ("/" + base_name,)).fetchone()
+                if row and row[0]:
+                    return {
+                        "guid": str(row[0]),
+                        "title": str(row[1] or ""),
+                        "artist": str(row[2] or ""),
+                        "album": str(row[3] or ""),
+                    }
+            except Exception:
+                pass
+        return None
+    finally:
+        con.close()
+
+
 def build_online_track(item: dict) -> dict:
     """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
     guid = online_guid_from_item(item)
@@ -950,6 +1017,24 @@ def build_online_track(item: dict) -> dict:
     cover = str(item.get("cover_url") or "")
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
+
+    # 本地实体动态感知：若该歌曲已下载落库（或已在本地曲库），秒级将格式、大小、物理路径对齐到本地文件
+    cached = find_cache_file(guid) or is_in_library(guid)
+    if cached and os.path.exists(cached) and os.path.getsize(cached) > 0:
+        local_ext = os.path.splitext(cached)[1].lstrip(".").lower()
+        if local_ext:
+            ext = local_ext
+            play_format = play_format_from_ext(local_ext)
+        try:
+            file_size = os.path.getsize(cached)
+        except OSError:
+            pass
+        spec_path = cached
+        # 专辑容错补充：若原信息为未知专辑，官方库已有收录则对齐真实专辑名
+        if album in ("未知专辑", "未知", "unknown album", "unknown", ""):
+            meta = official_track_meta_by_path(cached)
+            if meta and meta.get("album"):
+                album = meta["album"]
 
     artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
@@ -999,7 +1084,7 @@ def build_online_track(item: dict) -> dict:
         "coverUrl": cover,
         "coverURL": cover,
         "source": src,
-        "is_online": True,
+        "is_online": not bool(cached),
         "isFavorite": False,
         "isCue": False,
         "hasLyric": bool(item.get("lyric")),
@@ -2957,6 +3042,9 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
         "coverId": guid,
         "coverUrl": vo.get("coverUrl") or "",
         "format": vo.get("format") or "mp3",
+        "codec": vo.get("codec") or vo.get("format") or "mp3",
+        "size": vo.get("size") or 0,
+        "file_size": vo.get("file_size") or 0,
         "hasLyric": bool(vo.get("hasLyric") or info.get("lyric")),
         "isFavorite": False,
         "isCue": False,
@@ -4707,56 +4795,8 @@ def official_track_guid_by_path(path: str) -> "str | None":
     存在何种差异，fnOS 媒体库扫描落盘文件后，audio_file.path 记录的就是
     该文件的物理绝对路径或子路径。物理路径匹配 100% 免疫标签差异。
     """
-    path_s = (path or "").strip()
-    if not path_s:
-        return None
-    db = str(CONF.get("music_db") or "")
-    if not db or not os.path.exists(db):
-        return None
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    except Exception as e:
-        logger.warning("Official bind db open failed: %s", e)
-        return None
-    try:
-        abs_p = os.path.abspath(path_s)
-        real_p = os.path.realpath(path_s)
-        base_name = os.path.basename(path_s)
-
-        # 1. 精确物理路径匹配（绝对路径、真实路径与原路径）
-        for p in dict.fromkeys([path_s, abs_p, real_p]):
-            if not p:
-                continue
-            try:
-                row = con.execute(
-                    "SELECT t.guid FROM track t "
-                    "JOIN audio_file a ON a.id = t.audio_file_id "
-                    "WHERE a.path = ? ORDER BY t.id DESC LIMIT 1",
-                    (p,),
-                ).fetchone()
-                if row and row[0]:
-                    return str(row[0])
-            except Exception as e:
-                # 兼容旧版本或测试库无 audio_file 表结构
-                logger.debug("Official bind path query failed: %s", e)
-                return None
-
-        # 2. 物理文件名后缀匹配（/%s），防止宿主机与容器内挂载前缀路径不一致
-        if base_name:
-            try:
-                row = con.execute(
-                    "SELECT t.guid FROM track t "
-                    "JOIN audio_file a ON a.id = t.audio_file_id "
-                    "WHERE a.path LIKE '%' || ? ORDER BY t.id DESC LIMIT 1",
-                    ("/" + base_name,),
-                ).fetchone()
-                if row and row[0]:
-                    return str(row[0])
-            except Exception:
-                pass
-        return None
-    finally:
-        con.close()
+    meta = official_track_meta_by_path(path)
+    return meta["guid"] if meta else None
 
 
 def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "str | None":
@@ -6504,10 +6544,16 @@ def build_favorite_track_obj(
     }
 
     audio_spec = vo.get("audioSpec") or {}
+    play_format = vo.get("format") or "mp3"
+    file_size = vo.get("size") or 0
 
     obj = {
         "guid": guid,
         "title": vo.get("title") or "",
+        "format": play_format,
+        "codec": play_format,
+        "size": file_size,
+        "file_size": file_size,
         "duration": vo.get("duration") or 0,
         "isFavorite": True,
         "isCue": False,
