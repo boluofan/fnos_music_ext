@@ -1076,6 +1076,17 @@ def build_online_track(item: dict) -> dict:
             if album in ("未知专辑", "未知", "unknown album", "unknown", "") and meta.get("album"):
                 album = meta["album"]
 
+    is_fav = False
+    if cached:
+        try:
+            _, db_paths, db_tags = official_favorites_cache()
+            if cached in db_paths or os.path.basename(cached) in db_paths:
+                is_fav = True
+            elif title and artist and (title.strip().lower(), artist.strip().lower()) in db_tags:
+                is_fav = True
+        except Exception:
+            pass
+
     artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
         "name": album,
@@ -1125,7 +1136,7 @@ def build_online_track(item: dict) -> dict:
         "coverURL": cover,
         "source": src,
         "is_online": not bool(cached),
-        "isFavorite": False,
+        "isFavorite": is_fav,
         "isCue": False,
         "hasLyric": bool(item.get("lyric")),
         "genres": [],
@@ -3105,7 +3116,7 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
         "size": vo.get("size") or 0,
         "file_size": vo.get("file_size") or 0,
         "hasLyric": bool(vo.get("hasLyric") or info.get("lyric")),
-        "isFavorite": False,
+        "isFavorite": bool(vo.get("isFavorite")),
         "isCue": False,
         "accessStatus": 0,
         "audioSpec": vo["audioSpec"],
@@ -6134,7 +6145,7 @@ async def track_lyrics(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/track/metadata/{subpath:path}")
 @app.get("/music/api/v1/track/audio-info")
 async def track_metadata(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath or None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -6150,11 +6161,33 @@ async def track_metadata(request: Request, subpath: str = ""):
             artist=str(data.get("artist") or ""),
         )
     payload = build_metadata_payload(guid, data)
-    if guid in await _online_favorite_set(request):
-        if isinstance(payload.get("data"), dict):
-            payload["data"]["isFavorite"] = True
-            if isinstance(payload["data"].get("track"), dict):
-                payload["data"]["track"]["isFavorite"] = True
+
+    upstream_client = get_upstream_client(request.app)
+    is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed:
+        user_guid = "shared"
+    online_favs = await _online_favorite_set(request)
+    _, db_paths, db_tags = official_favorites_cache()
+
+    vo = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    t_path = (vo.get("audioSpec") or {}).get("path") or ""
+    t_title = vo.get("title") or (data or {}).get("title") or ""
+    t_artist = (vo.get("artist") or {}).get("name") if isinstance(vo.get("artist"), dict) else (vo.get("artist") or (data or {}).get("artist") or "")
+
+    is_fav = is_online_track_favorited(
+        guid=guid,
+        user_guid=user_guid,
+        cached_path=t_path,
+        title=t_title,
+        artist=str(t_artist or ""),
+        online_fav_set=online_favs,
+        official_fav_paths=db_paths,
+        official_fav_tags=db_tags,
+    )
+    if isinstance(payload.get("data"), dict):
+        payload["data"]["isFavorite"] = is_fav
+        if isinstance(payload["data"].get("track"), dict):
+            payload["data"]["track"]["isFavorite"] = is_fav
     return JSONResponse(content=disguise_client_json(payload))
 
 
@@ -8503,6 +8536,22 @@ async def track_album_detail_list(request: Request):
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持专辑详情", "data": None})
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     tracks = list(data.get("tracks") or [])
+    online_favs = await _online_favorite_set(request)
+    _, db_paths, db_tags = official_favorites_cache()
+    for trk in tracks:
+        tg = trk.get("guid") or ""
+        t_path = (trk.get("audioSpec") or {}).get("path") or ""
+        t_title = trk.get("title") or ""
+        t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
+        trk["isFavorite"] = is_online_track_favorited(
+            guid=tg,
+            cached_path=t_path,
+            title=t_title,
+            artist=str(t_artist or ""),
+            online_fav_set=online_favs,
+            official_fav_paths=db_paths,
+            official_fav_tags=db_tags,
+        )
     return JSONResponse(content=disguise_client_json(_album_list_envelope(request, tracks)))
 
 

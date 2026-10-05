@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-10-05
+
+### 修复底部播放条收藏爱心标识未亮起（空心）的问题
+
+- **根因分析**：
+  1. **元数据接口收藏状态判断过窄**：前端播放歌曲时，底部播放条组件会调用 `/music/api/v1/track/metadata`（或 `/track/audio-info`）端点获取当前正在播放歌曲的元数据。此前该端点仅检查 `load_online_favorites`；
+  2. **转正后数据失配导致前端状态被冲刷**：当一首歌（如“红尘误此生”）下载落库并被自动转正录入官方 `favorite_track` 数据库后，在线收藏表中已无该曲目条目。在列表渲染时虽然通过 `is_online_track_favorited` 赋予了 `isFavorite = True`（显示红心），但一旦开始播放，播放器组件从 `/track/metadata` 拉取最新信息，收到 `isFavorite = false`，从而将底部播放条的爱心重新冲刷为空心！
+- **解决方案**：
+  1. **核心曲目构造器动态感知收藏（`build_online_track`）**：在基础曲目构造器中联动 `official_favorites_cache`，只要歌曲已下载落库并在官方 `favorite_track` 中，基础对象即时携带 `isFavorite: True`，全端所有复用场景天然继承正确收藏状态；
+  2. **播放器元数据端点全量多层级判定（`track_metadata`）**：将 `track_metadata` 与 `track/audio-info` 端点全面接入全局 5 层收藏判定器 `is_online_track_favorited`，同时修正路径参数中的伪装 GUID 反解，彻底保证当前播放歌曲元数据中的 `isFavorite` 与列表状态 100% 保持一致，底部播放条爱心牢固高亮；
+  3. **专辑曲目列表补全（`track_album_detail_list`）**：为在线专辑详情列表同步补齐 `is_online_track_favorited` 判定。
+
 ## [2.7.9] - 2026-10-05
 
 ### 修复 TOP500 榜单与最近播放列表歌曲封面显示为灰色音符 ♫ 的问题
