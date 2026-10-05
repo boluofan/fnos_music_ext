@@ -4663,11 +4663,110 @@ def _register_bind_intent(guid: str, user_guid: str, headers: "dict | None",
         intent["fav"] = True
 
 
+def _clean_track_title(title: str) -> list[str]:
+    """返回候选标题列表：原标题、去除括号注释（feat/Live/合唱版等）后的标题。"""
+    res: list[str] = []
+    t = (title or "").strip()
+    if t:
+        res.append(t)
+    # 去除 (feat. xxx), (Live), (合唱版), [xxx], 【xxx】, （xxx） 等
+    cleaned = re.sub(r'[\(\[\（\【][^\(\)\[\]\（\）\【\】]*[\)\]\）\】]', '', t).strip()
+    if cleaned and cleaned not in res:
+        res.append(cleaned)
+    # 去除连字符后缀，例如 "男人歌 - 合唱版" -> "男人歌"
+    if " - " in cleaned:
+        stem = cleaned.split(" - ")[0].strip()
+        if stem and stem not in res:
+            res.append(stem)
+    elif " - " in t:
+        stem = t.split(" - ")[0].strip()
+        if stem and stem not in res:
+            res.append(stem)
+    return res
+
+
+def _split_artists(artist: str) -> list[str]:
+    """返回候选歌手列表：原串、拆分后的各个独立歌手。"""
+    res: list[str] = []
+    a = (artist or "").strip()
+    if a:
+        res.append(a)
+    # 按照常见多歌手分隔符拆分：/ 、 & , _ ； ; feat. ft.
+    parts = re.split(r'[/、&,_；;]|(?i:\s+feat\.?\s+|\s+ft\.?\s+|\s+vs\.?\s+)', a)
+    for p in parts:
+        p_clean = p.strip()
+        if p_clean and p_clean not in res:
+            res.append(p_clean)
+    return res
+
+
+def official_track_guid_by_path(path: str) -> "str | None":
+    """只读官方 music.db，按落盘物理文件路径匹配 track.guid（最新一条优先）。
+
+    无论在线源与官方库的元数据标签（如 feat. 注释、歌手顺序、未知专辑）
+    存在何种差异，fnOS 媒体库扫描落盘文件后，audio_file.path 记录的就是
+    该文件的物理绝对路径或子路径。物理路径匹配 100% 免疫标签差异。
+    """
+    path_s = (path or "").strip()
+    if not path_s:
+        return None
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except Exception as e:
+        logger.warning("Official bind db open failed: %s", e)
+        return None
+    try:
+        abs_p = os.path.abspath(path_s)
+        real_p = os.path.realpath(path_s)
+        base_name = os.path.basename(path_s)
+
+        # 1. 精确物理路径匹配（绝对路径、真实路径与原路径）
+        for p in dict.fromkeys([path_s, abs_p, real_p]):
+            if not p:
+                continue
+            try:
+                row = con.execute(
+                    "SELECT t.guid FROM track t "
+                    "JOIN audio_file a ON a.id = t.audio_file_id "
+                    "WHERE a.path = ? ORDER BY t.id DESC LIMIT 1",
+                    (p,),
+                ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            except Exception as e:
+                # 兼容旧版本或测试库无 audio_file 表结构
+                logger.debug("Official bind path query failed: %s", e)
+                return None
+
+        # 2. 物理文件名后缀匹配（/%s），防止宿主机与容器内挂载前缀路径不一致
+        if base_name:
+            try:
+                row = con.execute(
+                    "SELECT t.guid FROM track t "
+                    "JOIN audio_file a ON a.id = t.audio_file_id "
+                    "WHERE a.path LIKE '%' || ? ORDER BY t.id DESC LIMIT 1",
+                    ("/" + base_name,),
+                ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            except Exception:
+                pass
+        return None
+    finally:
+        con.close()
+
+
 def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "str | None":
     """只读官方 music.db，按落盘标签匹配曲目的官方 guid（最新一条优先）。
 
-    标签由 write_audio_tags 写入、官方扫描入库时读取，精确匹配即高保真；
-    精确未命中再用大小写不敏感兜底一次（官方扫描器可能做过归一化）。
+    标签由 write_audio_tags 写入、官方扫描入库时读取。
+    支持：
+    1. 标题去除括号注释（feat/Live/合唱版等）容错匹配；
+    2. 歌手多值拆分/顺序颠倒容错匹配（a.name IN (...) 或 a.name LIKE）；
+    3. 专辑为“未知专辑”或未匹配时降级忽略专辑过滤。
     """
     title_s = (title or "").strip()
     artist_s = (artist or "").strip()
@@ -4683,29 +4782,67 @@ def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "st
         logger.warning("Official bind db open failed: %s", e)
         return None
     try:
-        for nocase in (False, True):
-            collate = " COLLATE NOCASE" if nocase else ""
-            sql = (
-                "SELECT t.guid FROM track t "
-                "JOIN track_artist ta ON ta.track_id = t.id "
-                "JOIN artist a ON a.id = ta.artist_id "
-                f"WHERE t.title = ?{collate} AND a.name = ?{collate}"
-            )
-            params: list = [title_s, artist_s]
-            if album_s:
-                sql += (
-                    " AND EXISTS (SELECT 1 FROM album al"
-                    f" WHERE al.id = t.album_id AND al.name = ?{collate})"
-                )
-                params.append(album_s)
-            sql += " ORDER BY t.id DESC LIMIT 1"
-            try:
-                row = con.execute(sql, params).fetchone()
-            except Exception as e:
-                logger.warning("Official bind db query failed: %s", e)
-                return None
-            if row and row[0]:
-                return str(row[0])
+        title_candidates = _clean_track_title(title_s)
+        artist_candidates = _split_artists(artist_s)
+        album_clean = album_s
+        if album_clean.lower() in ("未知专辑", "未知", "unknown album", "unknown", "top500", "hot", "none", "null"):
+            album_clean = ""
+
+        # 多级降级策略：有专辑先带专辑查，未命中再降级无专辑查
+        album_stages = [album_clean, ""] if album_clean else [""]
+
+        for cur_album in album_stages:
+            for nocase in (False, True):
+                collate = " COLLATE NOCASE" if nocase else ""
+                for t_cand in title_candidates:
+                    # 1. 歌手集合匹配：a.name IN (...)
+                    placeholders = ",".join("?" for _ in artist_candidates)
+                    sql = (
+                        "SELECT t.guid FROM track t "
+                        "JOIN track_artist ta ON ta.track_id = t.id "
+                        "JOIN artist a ON a.id = ta.artist_id "
+                        f"WHERE t.title = ?{collate} AND a.name IN ({placeholders}){collate}"
+                    )
+                    params: list = [t_cand] + artist_candidates
+                    if cur_album:
+                        sql += (
+                            " AND EXISTS (SELECT 1 FROM album al"
+                            f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+                        )
+                        params.append(cur_album)
+                    sql += " ORDER BY t.id DESC LIMIT 1"
+                    try:
+                        row = con.execute(sql, params).fetchone()
+                        if row and row[0]:
+                            return str(row[0])
+                    except Exception as e:
+                        logger.warning("Official bind db query failed: %s", e)
+                        return None
+
+                    # 2. 歌手模糊匹配：a.name LIKE '%' || ? || '%'（兼容反向排序或未拆分）
+                    for a_cand in artist_candidates:
+                        if len(a_cand) < 2:
+                            continue
+                        sql = (
+                            "SELECT t.guid FROM track t "
+                            "JOIN track_artist ta ON ta.track_id = t.id "
+                            "JOIN artist a ON a.id = ta.artist_id "
+                            f"WHERE t.title = ?{collate} AND a.name LIKE '%' || ? || '%'{collate}"
+                        )
+                        params = [t_cand, a_cand]
+                        if cur_album:
+                            sql += (
+                                " AND EXISTS (SELECT 1 FROM album al"
+                                f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+                            )
+                            params.append(cur_album)
+                        sql += " ORDER BY t.id DESC LIMIT 1"
+                        try:
+                            row = con.execute(sql, params).fetchone()
+                            if row and row[0]:
+                                return str(row[0])
+                        except Exception:
+                            pass
         return None
     finally:
         con.close()
@@ -4714,9 +4851,8 @@ def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "st
 def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | None":
     """按标签在官方 music.db 反查曲库文件路径（audio_file.path，最新优先）。
 
-    find_cache_file 的兜底数据源：与 official_track_guid_by_tags 同款两遍
-    精确/NOCASE 查询，但取 a.path 且逐行校验文件确实存在（官方库里的
-    悬空记录不算命中）。
+    find_cache_file 的兜底数据源：与 official_track_guid_by_tags 同款容错匹配，
+    取 a.path 且逐行校验文件确实存在（官方库里的悬空记录不算命中）。
     """
     title_s = (title or "").strip()
     artist_s = (artist or "").strip()
@@ -4732,32 +4868,72 @@ def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | Non
         logger.warning("Library tags lookup db open failed: %s", e)
         return None
     try:
-        for nocase in (False, True):
-            collate = " COLLATE NOCASE" if nocase else ""
-            sql = (
-                "SELECT a.path FROM track t "
-                "JOIN audio_file a ON a.id = t.audio_file_id "
-                "JOIN track_artist ta ON ta.track_id = t.id "
-                "JOIN artist ar ON ar.id = ta.artist_id "
-                f"WHERE t.title = ?{collate} AND ar.name = ?{collate}"
-            )
-            params: list = [title_s, artist_s]
-            if album_s:
-                sql += (
-                    " AND EXISTS (SELECT 1 FROM album al"
-                    f" WHERE al.id = t.album_id AND al.name = ?{collate})"
-                )
-                params.append(album_s)
-            sql += " ORDER BY t.id DESC"
-            try:
-                rows = con.execute(sql, params).fetchall()
-            except Exception as e:
-                logger.warning("Library tags lookup query failed: %s", e)
-                return None
-            for row in rows:
-                path = str(row[0] or "").strip()
-                if path and os.path.isfile(path) and os.path.getsize(path) > 0:
-                    return path
+        title_candidates = _clean_track_title(title_s)
+        artist_candidates = _split_artists(artist_s)
+        album_clean = album_s
+        if album_clean.lower() in ("未知专辑", "未知", "unknown album", "unknown", "top500", "hot", "none", "null"):
+            album_clean = ""
+
+        album_stages = [album_clean, ""] if album_clean else [""]
+
+        for cur_album in album_stages:
+            for nocase in (False, True):
+                collate = " COLLATE NOCASE" if nocase else ""
+                for t_cand in title_candidates:
+                    # 1. 歌手集合精确匹配
+                    placeholders = ",".join("?" for _ in artist_candidates)
+                    sql = (
+                        "SELECT a.path FROM track t "
+                        "JOIN audio_file a ON a.id = t.audio_file_id "
+                        "JOIN track_artist ta ON ta.track_id = t.id "
+                        "JOIN artist ar ON ar.id = ta.artist_id "
+                        f"WHERE t.title = ?{collate} AND ar.name IN ({placeholders}){collate}"
+                    )
+                    params: list = [t_cand] + artist_candidates
+                    if cur_album:
+                        sql += (
+                            " AND EXISTS (SELECT 1 FROM album al"
+                            f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+                        )
+                        params.append(cur_album)
+                    sql += " ORDER BY t.id DESC"
+                    try:
+                        rows = con.execute(sql, params).fetchall()
+                        for row in rows:
+                            path = str(row[0] or "").strip()
+                            if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                                return path
+                    except Exception as e:
+                        logger.warning("Library tags lookup query failed: %s", e)
+                        return None
+
+                    # 2. 歌手模糊匹配
+                    for a_cand in artist_candidates:
+                        if len(a_cand) < 2:
+                            continue
+                        sql = (
+                            "SELECT a.path FROM track t "
+                            "JOIN audio_file a ON a.id = t.audio_file_id "
+                            "JOIN track_artist ta ON ta.track_id = t.id "
+                            "JOIN artist ar ON ar.id = ta.artist_id "
+                            f"WHERE t.title = ?{collate} AND ar.name LIKE '%' || ? || '%'{collate}"
+                        )
+                        params = [t_cand, a_cand]
+                        if cur_album:
+                            sql += (
+                                " AND EXISTS (SELECT 1 FROM album al"
+                                f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+                            )
+                            params.append(cur_album)
+                        sql += " ORDER BY t.id DESC"
+                        try:
+                            rows = con.execute(sql, params).fetchall()
+                            for row in rows:
+                                path = str(row[0] or "").strip()
+                                if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                                    return path
+                        except Exception:
+                            pass
         return None
     finally:
         con.close()
@@ -4785,7 +4961,7 @@ async def _official_upstream_write(method: str, path: str, headers: dict, payloa
 def _fav_bind_pending(guid: str, user_guid: str) -> bool:
     try:
         return any(
-            it.get("guid") == guid and it.get("bind") == "pending"
+            it.get("guid") == guid and (it.get("bind") == "pending" or CONF.get("fav_auto_bind"))
             for it in load_online_favorites(user_guid)
         )
     except Exception:
@@ -4793,11 +4969,11 @@ def _fav_bind_pending(guid: str, user_guid: str) -> bool:
 
 
 async def _remove_fav_bound(guid: str, user_guid: str) -> bool:
-    """官方收藏写入成功后删本地映射条目（仅 bind=pending；老数据不动）。"""
+    """官方收藏写入成功后删本地映射条目（若已绑定官方则清理在线条目，避免双列表重复显示）。"""
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
-            kept = [it for it in items if not (it.get("guid") == guid and it.get("bind") == "pending")]
+            kept = [it for it in items if not (it.get("guid") == guid and (it.get("bind") == "pending" or CONF.get("fav_auto_bind")))]
             if len(kept) == len(items):
                 return False
             save_online_favorites(user_guid, kept)
@@ -4810,7 +4986,10 @@ async def _remove_fav_bound(guid: str, user_guid: str) -> bool:
 def _plt_bind_pending(playlist_guid: str, guid: str, user_guid: str) -> bool:
     try:
         bucket = load_playlist_tracks(user_guid).get(playlist_guid) or []
-        return any(it.get("guid") == guid and it.get("bind") == "pending" for it in bucket)
+        return any(
+            it.get("guid") == guid and (it.get("bind") == "pending" or CONF.get("fav_auto_bind"))
+            for it in bucket
+        )
     except Exception:
         return False
 
@@ -4822,7 +5001,7 @@ async def _remove_plt_bound(playlist_guid: str, guid: str, user_guid: str) -> bo
             bucket = items.get(playlist_guid)
             if not bucket:
                 return False
-            kept = [it for it in bucket if not (it.get("guid") == guid and it.get("bind") == "pending")]
+            kept = [it for it in bucket if not (it.get("guid") == guid and (it.get("bind") == "pending" or CONF.get("fav_auto_bind")))]
             if len(kept) == len(bucket):
                 return False
             if kept:
@@ -4869,14 +5048,17 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     title = str((meta or {}).get("title") or "")
     artist = str((meta or {}).get("artist") or "")
     album = str((meta or {}).get("album") or "")
+    dest_path = str((meta or {}).get("dest") or "")
+    if not dest_path:
+        dest_path = recalled_media_path(guid) or is_in_library(guid) or find_cache_file(guid) or ""
     if not (title.strip() and artist.strip()):
         snap = _lookup_online_snapshot(guid) or charts.find_track(guid)
         snap = _snapshot_to_info(snap) if isinstance(snap, dict) and snap else {}
         title = title.strip() or str(snap.get("title") or "")
         artist = artist.strip() or str(snap.get("artist") or "")
         album = album.strip() or str(snap.get("album") or "")
-    if not (title.strip() and artist.strip()):
-        logger.info("Official bind skip for %s: no usable metadata", guid)
+    if not dest_path and not (title.strip() and artist.strip()):
+        logger.info("Official bind skip for %s: no usable metadata or path", guid)
         return
     # 官方只认曲库内 guid：等待官方把刚落盘文件扫入库（只读轮询，绝不写官方库）
     _schedule_library_scan(headers)
@@ -4885,10 +5067,27 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     except (TypeError, ValueError):
         timeout_s = 120.0
     deadline = time.monotonic() + timeout_s
-    official_guid = await asyncio.to_thread(official_track_guid_by_tags, title, artist, album)
+
+    def _lookup_official() -> "str | None":
+        nonlocal dest_path
+        if not dest_path:
+            dest_path = recalled_media_path(guid) or is_in_library(guid) or find_cache_file(guid) or ""
+        # 1. 优先按物理文件路径反查官方库（最精准、100% 免疫标签差异）
+        if dest_path:
+            g = official_track_guid_by_path(dest_path)
+            if g:
+                return g
+        # 2. 标签容错反查
+        if title.strip() and artist.strip():
+            g = official_track_guid_by_tags(title, artist, album)
+            if g:
+                return g
+        return None
+
+    official_guid = await asyncio.to_thread(_lookup_official)
     while not official_guid and time.monotonic() < deadline:
         await asyncio.sleep(_BIND_POLL_INTERVAL_S)
-        official_guid = await asyncio.to_thread(official_track_guid_by_tags, title, artist, album)
+        official_guid = await asyncio.to_thread(_lookup_official)
     if not official_guid:
         logger.info(
             "Official bind wait timeout for %s (%s - %s)：官方曲库尚未收录，保留本地映射待自愈重试",
@@ -4903,10 +5102,8 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
             _record_bind(user_guid, guid, official_guid)
             logger.info("Official favorite bound for %s (%s) -> %s", guid, user_guid, official_guid)
         elif ok:
-            # 写官方期间用户已取消收藏：补偿撤销官方收藏，不留幽灵状态
-            await _official_upstream_write(
-                "POST", "/music/api/v1/favorite-track/delete", headers, {"trackGUID": official_guid},
-            )
+            # 官方已写入，若本地在线条目已不复存在（或已在本地条目点收藏），确保登记映射
+            _record_bind(user_guid, guid, official_guid)
     for playlist_guid in sorted(set(intent.get("playlists") or ())):
         if not _plt_bind_pending(playlist_guid, guid, user_guid):
             continue
@@ -4918,10 +5115,7 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
             _record_bind(user_guid, guid, official_guid, playlist_guid=playlist_guid)
             logger.info("Official playlist bound for %s (%s -> %s)", guid, playlist_guid, official_guid)
         elif ok:
-            await _official_upstream_write(
-                "POST", "/music/api/v1/playlist/remove-track", headers,
-                {"guid": playlist_guid, "trackGUIDs": [official_guid]},
-            )
+            _record_bind(user_guid, guid, official_guid, playlist_guid=playlist_guid)
     # 意图清理：本地已无 pending 条目则移除；失败项保留待列表读取自愈重试
     live = _bind_pending.get(guid, {}).get(user_guid)
     if live is not None:
@@ -5143,8 +5337,9 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
         for guid in guids[:_BIND_RETRY_BATCH]:
             _register_bind_intent(guid, user_guid, headers, playlist_guid)
     for guid in uniq[:_BIND_RETRY_BATCH]:
-        if find_cache_file(guid):
-            _dispatch_official_binding(guid, headers, None)
+        cached = find_cache_file(guid) or is_in_library(guid)
+        if cached:
+            _dispatch_official_binding(guid, headers, {"dest": cached})
         else:
             _register_background_fetch(request, guid, "fav_auto_bind")
 
