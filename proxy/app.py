@@ -1009,6 +1009,30 @@ def official_track_meta_by_path(path: str) -> "dict | None":
         con.close()
 
 
+def official_track_path_by_guid(guid: str) -> "str | None":
+    """只读官方 music.db，按曲目 guid 或 cover_guid 反查本地物理文件路径。"""
+    guid_s = (guid or "").strip()
+    if not guid_s:
+        return None
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        cur = con.cursor()
+        row = cur.execute(
+            "SELECT a.path FROM track t JOIN audio_file a ON a.id = t.audio_file_id "
+            "WHERE t.guid = ? OR t.cover_guid = ? ORDER BY t.id DESC LIMIT 1",
+            (guid_s, guid_s),
+        ).fetchone()
+        con.close()
+        if row and row[0]:
+            return str(row[0])
+    except Exception as e:
+        logger.debug("official_track_path_by_guid failed: %s", e)
+    return None
+
+
 def build_online_track(item: dict) -> dict:
     """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
     guid = online_guid_from_item(item)
@@ -1051,8 +1075,6 @@ def build_online_track(item: dict) -> dict:
         if meta:
             if album in ("未知专辑", "未知", "unknown album", "unknown", "") and meta.get("album"):
                 album = meta["album"]
-            if meta.get("cover_guid"):
-                cover_id = meta["cover_guid"]
 
     artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
@@ -1501,7 +1523,17 @@ def _find_file_by_snapshot_tags(guid: str) -> "str | None":
     miss_at = _TAGS_LOOKUP_MISS.get(guid)
     if miss_at is not None and now - miss_at < _TAGS_MISS_TTL_S:
         return None
-    snap = _lookup_online_snapshot(guid)
+    real_guid = resolve_real_guid(guid)
+    snap = (
+        _lookup_online_snapshot(real_guid)
+        or _lookup_online_snapshot(guid)
+        or _ONLINE_TRACK_CACHE.get(real_guid)
+        or _ONLINE_TRACK_CACHE.get(guid)
+        or charts.find_track(real_guid)
+        or charts.find_track(guid)
+        or _lookup_playlist_cache_track(real_guid)
+        or _lookup_playlist_cache_track(guid)
+    )
     title = artist = album = ""
     if snap:
         title, artist, album = _tag_fields(snap)
@@ -1512,6 +1544,8 @@ def _find_file_by_snapshot_tags(guid: str) -> "str | None":
         _TAGS_LOOKUP_MISS[guid] = now
         return None
     remember_media_path(guid, path)
+    if real_guid != guid:
+        remember_media_path(real_guid, path)
     logger.info("Recalled library file for %s via tags: %s", guid, path)
     return path
 
@@ -3421,10 +3455,24 @@ async def search_track(request: Request):
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     merged["data"]["total"] = original_total + total_online
     fav_set = await _online_favorite_set(request)
-    if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
+    _, db_paths, db_tags = official_favorites_cache()
+    if isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
-            if isinstance(it, dict) and str(it.get("guid") or "") in fav_set:
-                it["isFavorite"] = True
+            if isinstance(it, dict):
+                tg = str(it.get("guid") or "")
+                t_path = (it.get("audioSpec") or {}).get("path") or ""
+                t_title = it.get("title") or ""
+                t_artist = (it.get("artist") or {}).get("name") if isinstance(it.get("artist"), dict) else (it.get("artist") or "")
+                if is_online_track_favorited(
+                    guid=tg,
+                    cached_path=t_path,
+                    title=t_title,
+                    artist=str(t_artist or ""),
+                    online_fav_set=fav_set,
+                    official_fav_paths=db_paths,
+                    official_fav_tags=db_tags,
+                ):
+                    it["isFavorite"] = True
     return JSONResponse(content=disguise_client_json(merged), status_code=upstream_resp.status_code, headers=resp_headers)
 
 
@@ -6257,9 +6305,15 @@ async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> 
 
 
 def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
-    """本地边听边存缓存文件的内嵌专辑图（mutagen 读 ID3/FLAC/MP4 封面）。"""
-    path = find_cache_file(guid)
-    if not path:
+    """本地音频文件的内嵌专辑图（mutagen 读 ID3/FLAC/MP4 封面）。"""
+    real_guid = resolve_real_guid(guid)
+    path = (
+        find_cache_file(real_guid)
+        or (find_cache_file(guid) if real_guid != guid else None)
+        or official_track_path_by_guid(guid)
+        or (official_track_path_by_guid(real_guid) if real_guid != guid else None)
+    )
+    if not path or not os.path.exists(path):
         return None
     try:
         from mutagen import File as MutagenFile
@@ -6390,41 +6444,55 @@ async def static_cover(request: Request, subpath: str = ""):
             return RedirectResponse(cover, status_code=302)
         return Response(status_code=404)
     if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        resp = await forward_to_upstream(request, get_upstream_client(request.app))
+        if resp.status_code == 200:
+            return resp
+        # 官方未生成封面（404/异常）时，尝试从本地落库文件的内嵌封面兜底
+        embedded = _embedded_cover_bytes(guid)
+        if embedded:
+            art, mime = embedded
+            return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+        return resp
 
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
         cover = str((album_entry.get("item") or {}).get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
+            if cover.startswith("http://"):
+                cover = "https://" + cover[len("http://"):]
             return RedirectResponse(cover, status_code=302)
         return _placeholder_cover_response(guid)
 
-    # ① 优先极速查榜单/内存在线曲目直链封面（0ms 响应，无需等待上游查询）
-    cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
-    if cached_t:
-        cov = _cover_url_of(cached_t)
-        if cov and _KW_TEXT_COVER_HOST not in cov:
-            return RedirectResponse(cov, status_code=302)
-
-    # ② 优先读取本地已缓存/入库音频文件的内嵌专辑图（0ms 本地磁盘直出，不依赖网络上游）
+    # ① 优先读取本地已缓存/入库音频文件的内嵌专辑图（0ms 本地磁盘直出，不依赖网络上游，彻底杜绝外链防盗链与 Mixed Content）
     embedded = _embedded_cover_bytes(guid)
     if embedded:
         art, mime = embedded
         return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
-    # ③ 若本地已有落库文件且官方数据库已扫出真实 cover_guid，重定向给官方返回
+    # ② 若本地已有落库文件且官方数据库已扫出真实 cover_guid，重定向给官方返回
     local_path = find_cache_file(guid)
     if local_path:
         meta = official_track_meta_by_path(local_path)
         if meta and meta.get("cover_guid"):
             return RedirectResponse(f"/static/cover/{meta['cover_guid']}", status_code=302)
 
+    # ③ 极速查榜单/内存在线曲目直链封面（0ms 响应，自动升级 https 避免 Mixed Content）
+    cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+    if cached_t:
+        cov = _cover_url_of(cached_t)
+        if cov and _KW_TEXT_COVER_HOST not in cov:
+            if cov.startswith("http://"):
+                cov = "https://" + cov[len("http://"):]
+            return RedirectResponse(cov, status_code=302)
+
     # ④ 尝试从历史/收藏快照或歌单缓存读取 cover_url（0ms 快速兜底）
     snap = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
     if snap:
         cov = _cover_url_of(snap)
         if cov and _KW_TEXT_COVER_HOST not in cov:
+            if cov.startswith("http://"):
+                cov = "https://" + cov[len("http://"):]
             return RedirectResponse(cov, status_code=302)
 
     data = await _online_info(request, guid)
@@ -6676,15 +6744,145 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
         return True, "shared", None
 
 
+_OFFICIAL_FAV_CACHE: "tuple[float, set[str], set[str], set[tuple[str, str]]]" = (0.0, set(), set(), set())
+_OFFICIAL_FAV_TTL_S = 5.0
+
+
+def official_favorites_cache() -> "tuple[set[str], set[str], set[tuple[str, str]]]":
+    global _OFFICIAL_FAV_CACHE
+    now = time.monotonic()
+    last_t, guids, paths, tags = _OFFICIAL_FAV_CACHE
+    if now - last_t < _OFFICIAL_FAV_TTL_S:
+        return guids, paths, tags
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return set(), set(), set()
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        cur = con.cursor()
+        sql1 = (
+            "SELECT t.guid, a.path, t.title, ar.name FROM favorite_track ft "
+            "JOIN track t ON t.id = ft.track_id "
+            "LEFT JOIN audio_file a ON a.id = t.audio_file_id "
+            "LEFT JOIN track_artist ta ON ta.track_id = t.id "
+            "LEFT JOIN artist ar ON ar.id = ta.artist_id"
+        )
+        rows = cur.execute(sql1).fetchall()
+        guids = set()
+        paths = set()
+        tags = set()
+        for r in rows:
+            if r[0]:
+                guids.add(str(r[0]))
+            if r[1]:
+                p_str = str(r[1])
+                paths.add(p_str)
+                paths.add(os.path.basename(p_str))
+            t_name = str(r[2] or "").strip().lower()
+            a_name = str(r[3] or "").strip().lower()
+            if t_name and a_name:
+                tags.add((t_name, a_name))
+        con.close()
+        _OFFICIAL_FAV_CACHE = (now, guids, paths, tags)
+        return guids, paths, tags
+    except Exception as e:
+        logger.debug("Failed to query official favorites: %s", e)
+        return set(), set(), set()
+
+
+def is_online_track_favorited(
+    guid: str,
+    user_guid: str = "",
+    cached_path: str | None = None,
+    title: str = "",
+    artist: str = "",
+    online_fav_set: set[str] | None = None,
+    official_fav_paths: set[str] | None = None,
+    official_fav_tags: set[tuple[str, str]] | None = None,
+) -> bool:
+    if not guid:
+        return False
+    real_guid = resolve_real_guid(guid)
+
+    # 1. 检查在线未转正收藏
+    if online_fav_set is not None:
+        if guid in online_fav_set or real_guid in online_fav_set:
+            return True
+    elif user_guid:
+        try:
+            if any(it.get("guid") in (guid, real_guid) for it in load_online_favorites(user_guid)):
+                return True
+        except Exception:
+            pass
+
+    # 2. 检查转正登记表（即使在线收藏条目已删，转正记录里仍保留了该在线 guid 的收藏状态）
+    if user_guid:
+        for g in (guid, real_guid):
+            bind_entry = lookup_bind_entry(user_guid, g)
+            if bind_entry and bind_entry.get("fav"):
+                return True
+    for g in (guid, real_guid):
+        any_bind = _lookup_bind_any_user(g)
+        if any_bind and any_bind[2].get("fav"):
+            return True
+
+    # 3. 检查官方曲库收藏 guid
+    db_guids, db_paths, db_tags = official_favorites_cache()
+    if guid in db_guids or real_guid in db_guids:
+        return True
+
+    # 4. 检查落盘物理文件是否在官方收藏中
+    path = cached_path or find_cache_file(real_guid) or (find_cache_file(guid) if real_guid != guid else None)
+    if not path:
+        path = official_track_path_by_guid(guid) or (official_track_path_by_guid(real_guid) if real_guid != guid else None)
+    if path:
+        chk_paths = official_fav_paths if official_fav_paths is not None else db_paths
+        if path in chk_paths or os.path.basename(path) in chk_paths:
+            return True
+
+    # 5. 检查歌名+歌手是否在官方收藏中
+    if not title or not artist:
+        snap = (
+            _lookup_online_snapshot(real_guid)
+            or _lookup_online_snapshot(guid)
+            or _ONLINE_TRACK_CACHE.get(real_guid)
+            or _ONLINE_TRACK_CACHE.get(guid)
+            or charts.find_track(real_guid)
+            or charts.find_track(guid)
+        )
+        if snap:
+            s_title, s_artist, _ = _tag_fields(snap)
+            if not title:
+                title = s_title
+            if not artist:
+                artist = s_artist
+
+    if title and artist:
+        t_clean = title.strip().lower()
+        a_clean = artist.strip().lower()
+        chk_tags = official_fav_tags if official_fav_tags is not None else db_tags
+        if (t_clean, a_clean) in chk_tags:
+            return True
+
+    return False
+
+
 async def _online_favorite_set(request: Request) -> set[str]:
     """当前用户在线收藏 guid 集合（探测失败回退 shared/空集，绝不抛错）。"""
     try:
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, _resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed:
-            return set()
+            user_guid = "shared"
+        fav_set = set()
         async with _FAV_LOCK:
-            return {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+            fav_set.update(str(it.get("guid") or "") for it in load_online_favorites(user_guid))
+        # 加上 bind_registry 中 fav=True 的在线 guid
+        _ensure_bind_registry()
+        for g, entry in _bind_registry.get(user_guid, {}).items():
+            if isinstance(entry, dict) and entry.get("fav"):
+                fav_set.add(g)
+        return fav_set
     except Exception:
         return set()
 
@@ -7852,7 +8050,8 @@ async def playlist_track_list(request: Request):
         # 在线附加条目接在官方条目之后（addedAt 倒序），逻辑区间
         # [official_total, official_total+len)；按请求页窗口切片，翻页不重不漏
         extras_sorted = sorted(extras, key=lambda x: x.get("addedAt", 0), reverse=True)
-        fav_guids = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+        online_favs = await _online_favorite_set(request)
+        _, db_paths, db_tags = official_favorites_cache()
         template = official_track_template(official_list)
         online_objs = []
         for it in extras_sorted:
@@ -7864,7 +8063,19 @@ async def playlist_track_list(request: Request):
                 g, _snapshot_to_info(snapshot) if snapshot else None,
                 created_at=it.get("addedAt"), template=template,
             )
-            obj["isFavorite"] = g in fav_guids
+            t_path = (obj.get("audioSpec") or {}).get("path") or ""
+            t_title = obj.get("title") or ""
+            t_artist = (obj.get("artist") or {}).get("name") if isinstance(obj.get("artist"), dict) else (obj.get("artist") or "")
+            obj["isFavorite"] = is_online_track_favorited(
+                guid=g,
+                user_guid=user_guid,
+                cached_path=t_path,
+                title=t_title,
+                artist=str(t_artist or ""),
+                online_fav_set=online_favs,
+                official_fav_paths=db_paths,
+                official_fav_tags=db_tags,
+            )
             online_objs.append(obj)
 
         try:
@@ -7917,6 +8128,24 @@ async def playlist_track_list(request: Request):
         else:
             start = (page - 1) * size
             page_tracks = tracks[start:start + size] if start < len(tracks) else []
+
+        online_favs = await _online_favorite_set(request)
+        _, db_paths, db_tags = official_favorites_cache()
+        for trk in page_tracks:
+            tg = trk.get("guid") or ""
+            t_path = (trk.get("audioSpec") or {}).get("path") or ""
+            t_title = trk.get("title") or ""
+            t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
+            trk["isFavorite"] = is_online_track_favorited(
+                guid=tg,
+                cached_path=t_path,
+                title=t_title,
+                artist=str(t_artist or ""),
+                online_fav_set=online_favs,
+                official_fav_paths=db_paths,
+                official_fav_tags=db_tags,
+            )
+
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
@@ -7946,6 +8175,25 @@ async def playlist_track_list(request: Request):
         size = 50
     start = (page - 1) * size
     page_tracks = tracks[start:start + size]
+
+    online_favs = await _online_favorite_set(request)
+    _, db_paths, db_tags = official_favorites_cache()
+    for trk in page_tracks:
+        tg = trk.get("guid") or ""
+        t_path = (trk.get("audioSpec") or {}).get("path") or ""
+        t_title = trk.get("title") or ""
+        t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
+        trk["isFavorite"] = is_online_track_favorited(
+            guid=tg,
+            user_guid=user_guid,
+            cached_path=t_path,
+            title=t_title,
+            artist=str(t_artist or ""),
+            online_fav_set=online_favs,
+            official_fav_paths=db_paths,
+            official_fav_tags=db_tags,
+        )
+
     return JSONResponse(
         content=disguise_client_json({
             "code": 0,
@@ -8640,7 +8888,8 @@ async def play_history_list(request: Request):
 
     async with _HISTORY_LOCK:
         online_items = dailyrec.load_online_play_history(user_guid)
-    fav_set = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+    online_favs = await _online_favorite_set(request)
+    _, db_paths, db_tags = official_favorites_cache()
     template = official_track_template(official)
     online_tracks = []
     for it in reversed(online_items):
@@ -8675,7 +8924,19 @@ async def play_history_list(request: Request):
             if cov:
                 info["cover_url"] = cov
         obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
-        obj["isFavorite"] = guid in fav_set
+        t_path = (obj.get("audioSpec") or {}).get("path") or ""
+        t_title = obj.get("title") or ""
+        t_artist = (obj.get("artist") or {}).get("name") if isinstance(obj.get("artist"), dict) else (obj.get("artist") or "")
+        obj["isFavorite"] = is_online_track_favorited(
+            guid=guid,
+            user_guid=user_guid,
+            cached_path=t_path,
+            title=t_title,
+            artist=str(t_artist or ""),
+            online_fav_set=online_favs,
+            official_fav_paths=db_paths,
+            official_fav_tags=db_tags,
+        )
         online_tracks.append(disguise_client_json(obj))
 
     seen = {str(x.get("guid")) for x in official if isinstance(x, dict)}
