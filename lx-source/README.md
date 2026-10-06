@@ -8,50 +8,52 @@
 
 ## 优质音源清单
 
-### 1. 🥇 全豆要 聚合音源 (首选推荐)
-* **文件**：[`全豆要-聚合音源-V4.1.js`](./全豆要-聚合音源-V4.1.js)
+### 1. 🥇 长青 SVIP 音源 (二改修复版)
+* **文件**：[`1长青SVIP音源(二改修复版) v1.2.0.js`](./1长青SVIP音源(二改修复版)%20v1.2.0.js)
+* **版本**：`v1.2.0`
 * **特点**：
-  * **四大平台通吃**：网易云 (`wy`)、QQ音乐 (`tx`)、酷我 (`kw`)、酷狗 (`kg`) 全部实测存活；
-  * **自带独立搜索**：脚本内置 `musicSearch` / `search` 自定义搜索接口；
+  * 高品质无损/高码率解析通过率高，支持主流四大平台音源调度；
   * 免 VIP 畅听全网热门流行歌曲与主流榜单。
 * **WebUI 直链订阅地址**：
   ```text
-  https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/全豆要-聚合音源-V4.1.js
+  https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/1长青SVIP音源(二改修复版)%20v1.2.0.js
   ```
   *(国内高速镜像)*:
   ```text
-  https://ghproxy.net/https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/全豆要-聚合音源-V4.1.js
+  https://ghproxy.net/https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/1长青SVIP音源(二改修复版)%20v1.2.0.js
   ```
 
 ---
 
-### 2. 🥈 念心音源
-* **文件**：[`念心音源-v1.0.2.js`](./念心音源-v1.0.2.js)
+### 2. 🥈 屿溪-终章 音源
+* **文件**：[`2屿溪-终章.js`](./2屿溪-终章.js)
+* **特点**：
+  * **超高音质母带支持**：支持主流 4 平台母带解析 + 咪咕 24bit；
+  * 纯净公益音源，多平台音源快速调度响应。
+* **WebUI 直链订阅地址**：
+  ```text
+  https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/2屿溪-终章.js
+  ```
+  *(国内高速镜像)*:
+  ```text
+  https://ghproxy.net/https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/2屿溪-终章.js
+  ```
+
+---
+
+### 3. 🥉 念心音源
+* **文件**：[`3念心音源 v1.0.2.js`](./3念心音源%20v1.0.2.js)
+* **版本**：`v1.0.2`
 * **特点**：
   * 纯净稳定，四大主流平台解析响应速度极快；
   * 免 VIP 畅听网易、QQ、酷我、酷狗歌曲。
 * **WebUI 直链订阅地址**：
   ```text
-  https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/念心音源-v1.0.2.js
+  https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/3念心音源%20v1.0.2.js
   ```
   *(国内高速镜像)*:
   ```text
-  https://ghproxy.net/https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/念心音源-v1.0.2.js
-  ```
-
----
-
-### 3. 🥉 长青 SVIP 音源
-* **文件**：[`长青SVIP音源-v1.3.0.js`](./长青SVIP音源-v1.3.0.js)
-* **特点**：
-  * 高品质无损/高码率解析通过率高，支持四大平台音源调度。
-* **WebUI 直链订阅地址**：
-  ```text
-  https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/长青SVIP音源-v1.3.0.js
-  ```
-  *(国内高速镜像)*:
-  ```text
-  https://ghproxy.net/https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/长青SVIP音源-v1.3.0.js
+  https://ghproxy.net/https://raw.githubusercontent.com/zouclang/fnos_music_ext/main/lx-source/3念心音源%20v1.0.2.js
   ```
 
 ---
