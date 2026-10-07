@@ -1311,7 +1311,7 @@ async def kg_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
             "album": "",  # rank 接口不返回专辑名
             "duration_s": int(it.get("duration") or 0),  # rank 接口 duration 单位为秒
             "ext": "flac" if sq else "mp3",
-            "cover_url": str(it.get("album_sizable_cover") or "").replace("{size}", "480"),
+            "cover_url": str(it.get("album_sizable_cover") or "").replace("{size}", "480").replace("http://", "https://"),
             "file_size": int(it.get("sqfilesize") or it.get("320filesize") or 0) or 0,
             "lyric": "",
             "hash": fhash,

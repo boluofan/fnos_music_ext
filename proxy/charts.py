@@ -28,26 +28,26 @@ DEFAULT_UA_PC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537
 
 # 酷狗音乐榜单列表（严格对齐主流热门排行榜）
 KG_CHARTS: list[dict[str, Any]] = [
-    {"id": "kg_8888", "name": "TOP500", "source": "kg", "rankid": 8888, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219164209670219.png"},
-    {"id": "kg_52144", "name": "国潮音乐榜", "source": "kg", "rankid": 85897, "cover": "http://imge.kugou.com/mcommon/400/20241120/20241120202644296668.jpg"},
-    {"id": "kg_52767", "name": "视频号热歌酷狗榜", "source": "kg", "rankid": 100530, "cover": "http://imge.kugou.com/mcommon/400/20260701/20260701213145443732.jpg"},
-    {"id": "kg_31313", "name": "民谣榜", "source": "kg", "rankid": 51341, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211184719475668.jpg"},
-    {"id": "kg_33161", "name": "纯音乐榜", "source": "kg", "rankid": 59900, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211185324343605.jpg"},
-    {"id": "kg_33162", "name": "电音榜", "source": "kg", "rankid": 33160, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211184628349205.jpg"},
-    {"id": "kg_23784", "name": "网络热歌榜", "source": "kg", "rankid": 82831, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219195626644029.png"},
-    {"id": "kg_6666", "name": "飙升榜", "source": "kg", "rankid": 6666, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219193628550054.png"},
-    {"id": "kg_52055", "name": "短视频热歌榜", "source": "kg", "rankid": 52144, "cover": "http://imge.kugou.com/mcommon/400/20260604/20260604150723458910.png"},
-    {"id": "kg_46908", "name": "摇滚榜", "source": "kg", "rankid": 59896, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211184944114279.jpg"},
-    {"id": "kg_24971", "name": "DJ热歌榜", "source": "kg", "rankid": 24971, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219194419154116.png"},
-    {"id": "kg_54884", "name": "国乐榜", "source": "kg", "rankid": 80025, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211184535924138.png"},
-    {"id": "kg_52054", "name": "百万收藏榜", "source": "kg", "rankid": 85432, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219171042182683.png"},
-    {"id": "kg_59717", "name": "短视频收藏人气榜", "source": "kg", "rankid": 52767, "cover": "http://imge.kugou.com/mcommon/400/20260702/20260702101133223934.png"},
-    {"id": "kg_24306", "name": "新歌榜", "source": "kg", "rankid": 74534, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219200509300768.png"},
-    {"id": "kg_52895", "name": "名品堂", "source": "kg", "rankid": 84235, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219195054422404.png"},
-    {"id": "kg_31308", "name": "内地榜", "source": "kg", "rankid": 31308, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211192146592398.png"},
-    {"id": "kg_33163", "name": "粤语金曲榜", "source": "kg", "rankid": 33165, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219200119140556.png"},
-    {"id": "kg_31310", "name": "欧美榜", "source": "kg", "rankid": 31310, "cover": "http://imge.kugou.com/mcommon/400/20241211/20241211192454699571.jpg"},
-    {"id": "kg_30972", "name": "伤感榜", "source": "kg", "rankid": 51340, "cover": "http://imge.kugou.com/mcommon/400/20241219/20241219195213930623.png"},
+    {"id": "kg_8888", "name": "TOP500", "source": "kg", "rankid": 8888, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219164209670219.png"},
+    {"id": "kg_52144", "name": "国潮音乐榜", "source": "kg", "rankid": 85897, "cover": "https://imge.kugou.com/mcommon/400/20241120/20241120202644296668.jpg"},
+    {"id": "kg_52767", "name": "视频号热歌酷狗榜", "source": "kg", "rankid": 100530, "cover": "https://imge.kugou.com/mcommon/400/20260701/20260701213145443732.jpg"},
+    {"id": "kg_31313", "name": "民谣榜", "source": "kg", "rankid": 51341, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211184719475668.jpg"},
+    {"id": "kg_33161", "name": "纯音乐榜", "source": "kg", "rankid": 59900, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211185324343605.jpg"},
+    {"id": "kg_33162", "name": "电音榜", "source": "kg", "rankid": 33160, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211184628349205.jpg"},
+    {"id": "kg_23784", "name": "网络热歌榜", "source": "kg", "rankid": 82831, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219195626644029.png"},
+    {"id": "kg_6666", "name": "飙升榜", "source": "kg", "rankid": 6666, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219193628550054.png"},
+    {"id": "kg_52055", "name": "短视频热歌榜", "source": "kg", "rankid": 52144, "cover": "https://imge.kugou.com/mcommon/400/20260604/20260604150723458910.png"},
+    {"id": "kg_46908", "name": "摇滚榜", "source": "kg", "rankid": 59896, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211184944114279.jpg"},
+    {"id": "kg_24971", "name": "DJ热歌榜", "source": "kg", "rankid": 24971, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219194419154116.png"},
+    {"id": "kg_54884", "name": "国乐榜", "source": "kg", "rankid": 80025, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211184535924138.png"},
+    {"id": "kg_52054", "name": "百万收藏榜", "source": "kg", "rankid": 85432, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219171042182683.png"},
+    {"id": "kg_59717", "name": "短视频收藏人气榜", "source": "kg", "rankid": 52767, "cover": "https://imge.kugou.com/mcommon/400/20260702/20260702101133223934.png"},
+    {"id": "kg_24306", "name": "新歌榜", "source": "kg", "rankid": 74534, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219200509300768.png"},
+    {"id": "kg_52895", "name": "名品堂", "source": "kg", "rankid": 84235, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219195054422404.png"},
+    {"id": "kg_31308", "name": "内地榜", "source": "kg", "rankid": 31308, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211192146592398.png"},
+    {"id": "kg_33163", "name": "粤语金曲榜", "source": "kg", "rankid": 33165, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219200119140556.png"},
+    {"id": "kg_31310", "name": "欧美榜", "source": "kg", "rankid": 31310, "cover": "https://imge.kugou.com/mcommon/400/20241211/20241211192454699571.jpg"},
+    {"id": "kg_30972", "name": "伤感榜", "source": "kg", "rankid": 51340, "cover": "https://imge.kugou.com/mcommon/400/20241219/20241219195213930623.png"},
 ]
 
 # 网易云音乐榜单列表（严格对齐网易云官方 Toplist，实时 CDN 直链）
@@ -271,9 +271,12 @@ async def fetch_kg_chart(client: httpx.AsyncClient, rankid: int, limit: int = 10
                 break
             if not cover_url:
                 info = res.get("info") or {}
-                cover_url = str(
+                raw_cov = str(
                     info.get("banner_9") or info.get("banner_7") or info.get("imgurl") or ""
                 ).replace("{size}", "400")
+                if raw_cov.startswith("http://"):
+                    raw_cov = "https://" + raw_cov[len("http://"):]
+                cover_url = raw_cov
         except Exception as e:
             logger.warning("kg rank %s page %d fetch failed: %s", rankid, page, e)
             break
@@ -296,6 +299,8 @@ async def fetch_kg_chart(client: httpx.AsyncClient, rankid: int, limit: int = 10
             if not title:
                 continue
             cover = str(it.get("album_sizable_cover") or "").replace("{size}", "480")
+            if cover.startswith("http://"):
+                cover = "https://" + cover[len("http://"):]
             tracks.append({
                 "id": f"lx:kg:{fhash}",
                 "source": "lx",

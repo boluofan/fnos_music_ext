@@ -198,12 +198,11 @@ def is_daily_playlist_guid(guid: str | None) -> bool:
 
 
 def pick_playlist_cover_track(tracks: list[dict] | None) -> dict | None:
-    """歌单封面取曲：优先第一个带可用封面直链的在线曲目；无在线封面时回落
-    第一首带官方 coverId 的本地曲目（封面端点对真实官方 guid 透传官方）。
-
-    跳过 cover_url 为空与酷我文本页假链接（KW_TEXT_COVER_HOST）的曲目；
-    都没有返回 None（封面端点据此 404，客户端显示自带默认样式）。
+    """歌单封面取曲：优先第一个带可用封面直链的在线曲目；
+    无在线封面时优先取第一首带真实官方 cover_guid 的本地曲目（coverId != guid）；
+    仍无时才回落普通本地曲目（由 static_cover 端点进行云端刮削兜底）。
     """
+    local_with_cover = None
     local_fallback = None
     for t in tracks or []:
         if not isinstance(t, dict):
@@ -212,9 +211,14 @@ def pick_playlist_cover_track(tracks: list[dict] | None) -> dict | None:
         if url and KW_TEXT_COVER_HOST not in url:
             return t
         cover_id = str(t.get("coverId") or "")
-        if local_fallback is None and cover_id and not cover_id.startswith("online:"):
-            local_fallback = t
-    return local_fallback
+        if cover_id and not cover_id.startswith("online:"):
+            guid = str(t.get("guid") or "")
+            if cover_id != guid:
+                if local_with_cover is None:
+                    local_with_cover = t
+            elif local_fallback is None:
+                local_fallback = t
+    return local_with_cover or local_fallback
 
 
 def infer_language(title: str = "", artist: str = "", album: str = "") -> str:
@@ -883,6 +887,9 @@ def _lx_recommend_item(it: dict) -> dict:
     tid = str(it.get("id") or "")
     if not tid:
         return {}
+    cov = str(it.get("cover_url") or "")
+    if cov.startswith("http://"):
+        cov = "https://" + cov[len("http://"):]
     return {
         "id": tid if tid.startswith("lx:") else f"lx:{tid}",
         "source": "lx",
@@ -891,7 +898,7 @@ def _lx_recommend_item(it: dict) -> dict:
         "album": str(it.get("album") or ""),
         "duration_s": float(it.get("duration_s") or 0) or 0,
         "ext": str(it.get("ext") or "mp3") or "mp3",
-        "cover_url": str(it.get("cover_url") or ""),
+        "cover_url": cov,
     }
 
 

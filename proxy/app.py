@@ -1033,6 +1033,41 @@ def official_track_path_by_guid(guid: str) -> "str | None":
     return None
 
 
+def official_track_meta_by_guid(guid: str) -> "dict | None":
+    """只读官方 music.db，按曲目 guid 或 cover_guid 反查元数据（title, artist, album, cover_guid, path）。"""
+    guid_s = (guid or "").strip()
+    if not guid_s or is_online_guid(guid_s):
+        return None
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        cur = con.cursor()
+        sql = (
+            "SELECT t.guid, t.title, ar.name, al.name, t.cover_guid, a.path FROM track t "
+            "JOIN audio_file a ON a.id = t.audio_file_id "
+            "LEFT JOIN album al ON al.id = t.album_id "
+            "LEFT JOIN track_artist ta ON ta.track_id = t.id "
+            "LEFT JOIN artist ar ON ar.id = ta.artist_id "
+            "WHERE t.guid = ? OR t.cover_guid = ? ORDER BY t.id DESC LIMIT 1"
+        )
+        row = cur.execute(sql, (guid_s, guid_s)).fetchone()
+        con.close()
+        if row and row[0]:
+            return {
+                "guid": str(row[0]),
+                "title": str(row[1] or ""),
+                "artist": str(row[2] or ""),
+                "album": str(row[3] or ""),
+                "cover_guid": str(row[4] or "") if len(row) > 4 else "",
+                "path": str(row[5] or "") if len(row) > 5 else "",
+            }
+    except Exception as e:
+        logger.debug("official_track_meta_by_guid failed: %s", e)
+    return None
+
+
 def build_online_track(item: dict) -> dict:
     """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
     guid = online_guid_from_item(item)
@@ -1055,6 +1090,8 @@ def build_online_track(item: dict) -> dict:
     except (TypeError, ValueError):
         file_size = 0
     cover = _cover_url_of(item)
+    if cover.startswith("http://"):
+        cover = "https://" + cover[len("http://"):]
     cover_id = guid
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
@@ -6281,58 +6318,91 @@ def _qq_cover_by_albummid(albummid: "str | None") -> str:
     return f"https://y.gtimg.cn/music/photo_new/T002R800x800M000{mid}.jpg?max_age=2592000"
 
 
-async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> str:
-    """musicdl/lx 空封面 → 网易 cloudsearch 同名曲补全（FNMUSIC_COVER_ENRICH=1）。"""
+async def _enrich_cover_via_netease(
+    request: Request, guid: str, data: dict, title: str = "", artist: str = ""
+) -> str:
+    """musicdl/lx 空封面或本地无封面歌曲 → 网易 cloudsearch 同名曲补全（FNMUSIC_COVER_ENRICH=1）。"""
     if not CONF.get("cover_enrich", True):
         return ""
-    title = str((data or {}).get("title") or "").strip()
+    if not title:
+        title = str((data or {}).get("title") or "").strip()
+    if not artist:
+        artist = str((data or {}).get("artist") or "").strip()
     if not title:
         return ""
-    artist = str((data or {}).get("artist") or "").strip()
     key = f"wy:{title.casefold()}|{artist.casefold()}"
     cached = _cover_cache_get(key)
     if cached:
         return cached
-    musicbox_client = get_musicbox_client(request.app)
+
     keyword = " ".join(x for x in (artist, title) if x)
     target = ""
+
+    # 1. 优先尝试直接请求网易云官方 CloudSearch API（免登录、直连、速度快、元数据全）
     try:
-        r = await musicbox_client.get(
-            "/api/v1/search",
-            params={"keyword": keyword, "limit": 5, "type": "song"},
-            timeout=8.0,
-        )
-        if r.status_code != 200:
-            return ""
-        payload = r.json()
-        raw = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(raw, list):
-            return ""
-        title_l = title.casefold()
-        artist_l = artist.casefold()
-        for it in raw:
-            if not isinstance(it, dict):
-                continue
-            it_title = str(it.get("song_name") or it.get("title") or "")
-            if it_title.casefold() != title_l:
-                continue
-            it_artist = str(it.get("artist") or "")
-            if artist_l and artist_l not in it_artist.casefold() and it_artist.casefold() not in artist_l:
-                continue
-            sid = str(it.get("song_id") or it.get("id") or "")
-            if not sid:
-                continue
-            d = await musicbox_client.get("/api/v1/songs/detail", params={"ids": sid}, timeout=8.0)
-            if d.status_code == 200:
-                dj = d.json()
-                dl = dj.get("data") if isinstance(dj, dict) else None
-                first = dl[0] if isinstance(dl, list) and dl and isinstance(dl[0], dict) else {}
-                target = str(first.get("album_pic_url") or "")
-            break
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(
+                "https://music.163.com/api/cloudsearch/pc",
+                params={"s": keyword, "type": "1", "limit": "3", "offset": "0"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://music.163.com",
+                },
+            )
+            if r.status_code == 200:
+                res = r.json()
+                if isinstance(res, dict):
+                    songs = res.get("result", {}).get("songs") or []
+                    for s in songs:
+                        if not isinstance(s, dict):
+                            continue
+                        pic = (s.get("al") or {}).get("picUrl") or (s.get("album") or {}).get("picUrl")
+                        if pic and isinstance(pic, str) and pic.startswith("http"):
+                            target = pic
+                            break
     except Exception as e:
-        logger.debug("cover enrich via netease failed for %s: %s", guid, e)
-        return ""
+        logger.debug("direct netease cloudsearch failed for %s (%s): %s", keyword, guid, e)
+
+    # 2. 直搜失败时，兜底尝试通过本地 musicbox-service 内部代理搜
+    if not target:
+        try:
+            musicbox_client = get_musicbox_client(request.app)
+            r = await musicbox_client.get(
+                "/api/v1/search",
+                params={"keyword": keyword, "limit": 5, "type": "song"},
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                payload = r.json()
+                raw = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(raw, list):
+                    title_l = title.casefold()
+                    artist_l = artist.casefold()
+                    for it in raw:
+                        if not isinstance(it, dict):
+                            continue
+                        it_title = str(it.get("song_name") or it.get("title") or "")
+                        if it_title.casefold() != title_l:
+                            continue
+                        it_artist = str(it.get("artist") or "")
+                        if artist_l and artist_l not in it_artist.casefold() and it_artist.casefold() not in artist_l:
+                            continue
+                        sid = str(it.get("song_id") or it.get("id") or "")
+                        if not sid:
+                            continue
+                        d = await musicbox_client.get("/api/v1/songs/detail", params={"ids": sid}, timeout=5.0)
+                        if d.status_code == 200:
+                            dj = d.json()
+                            dl = dj.get("data") if isinstance(dj, dict) else None
+                            first = dl[0] if isinstance(dl, list) and dl and isinstance(dl[0], dict) else {}
+                            target = str(first.get("album_pic_url") or "")
+                        break
+        except Exception as e:
+            logger.debug("cover enrich via musicbox failed for %s: %s", guid, e)
+
     if target:
+        if target.startswith("http://"):
+            target = "https://" + target[len("http://"):]
         _cover_cache_put(key, target)
     return target
 
@@ -6380,8 +6450,74 @@ def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
     return None
 
 
+_COVER_BYTES_CACHE: dict[str, tuple[bytes, str, float]] = {}
+_COVER_BYTES_MAX_ITEMS = 500
+_COVER_BYTES_TTL_S = 86400 * 7  # 7 days
+
+
+async def fetch_cover_image_bytes(url: str) -> "tuple[bytes, str] | None":
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    if _KW_TEXT_COVER_HOST in url:
+        return None
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    now = time.time()
+    hit = _COVER_BYTES_CACHE.get(url)
+    if hit and now - hit[2] < _COVER_BYTES_TTL_S:
+        return hit[0], hit[1]
+
+    try:
+        ref = "https://www.kugou.com"
+        if "126.net" in url:
+            ref = "https://music.163.com"
+        elif "gtimg" in url or "qq.com" in url:
+            ref = "https://y.qq.com"
+        elif "kuwo.cn" in url:
+            ref = "https://www.kuwo.cn"
+
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": ref,
+                },
+            )
+        if r.status_code != 200:
+            return None
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return None
+        mime = _sniff_image_mime(data) or r.headers.get("content-type", "image/jpeg").split(";")[0]
+        if not mime or not mime.startswith("image/"):
+            mime = "image/jpeg"
+        if len(_COVER_BYTES_CACHE) > _COVER_BYTES_MAX_ITEMS:
+            keys = list(_COVER_BYTES_CACHE.keys())[: _COVER_BYTES_MAX_ITEMS // 5]
+            for k in keys:
+                _COVER_BYTES_CACHE.pop(k, None)
+        _COVER_BYTES_CACHE[url] = (data, mime, now)
+        return data, mime
+    except Exception as e:
+        logger.debug("fetch_cover_image_bytes failed for %s: %s", url, type(e).__name__)
+        return None
+
+
+async def _serve_image_bytes_or_redirect(url: str) -> Response:
+    if not url:
+        return Response(status_code=404)
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    img = await fetch_cover_image_bytes(url)
+    if img:
+        data, mime = img
+        return Response(content=data, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+    return RedirectResponse(url, status_code=302)
+
+
 def _placeholder_cover_response(guid: str) -> Response:
-    """占位图池确定性选取（guid 哈希），客户端缓存 1 天。"""
+    """占位图池确定性选取（guid 哈希），客户端短缓存（防本地污染）。"""
     digest = hashlib.sha256(str(guid or "").encode()).hexdigest()
     name = f"placeholder-{int(digest[:8], 16) % _PLACEHOLDER_COUNT}.png"
     content = _PLACEHOLDER_CACHE.get(name)
@@ -6396,7 +6532,7 @@ def _placeholder_cover_response(guid: str) -> Response:
     return Response(
         content=content,
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "no-cache, max-age=5, must-revalidate"},
     )
 
 
@@ -6422,10 +6558,10 @@ async def static_cover(request: Request, subpath: str = ""):
                 except Exception as e:
                     logger.warning("Failed to fetch chart cover for %s: %s", chart_id, e)
             if cover:
-                return RedirectResponse(cover, status_code=302)
+                return await _serve_image_bytes_or_redirect(cover)
             meta = charts.chart_meta(chart_id)
             if meta and meta.get("cover") and not charts._is_dummy_cover(meta["cover"]):
-                return RedirectResponse(meta["cover"], status_code=302)
+                return await _serve_image_bytes_or_redirect(meta["cover"])
             return _placeholder_cover_response(guid)
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -6447,54 +6583,71 @@ async def static_cover(request: Request, subpath: str = ""):
                     headers=headers,
                 )
                 cover_resp = await upstream_client.send(cover_req, stream=True)
-                cover_headers = filter_headers(
-                    cover_resp.headers, exclude_keys={"content-length", "content-encoding"}
-                )
+                if cover_resp.status_code == 200:
+                    cover_headers = filter_headers(
+                        cover_resp.headers, exclude_keys={"content-length", "content-encoding"}
+                    )
 
-                async def _cover_stream():
-                    try:
-                        async for chunk in cover_resp.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await cover_resp.aclose()
+                    async def _cover_stream():
+                        try:
+                            async for chunk in cover_resp.aiter_bytes():
+                                yield chunk
+                        finally:
+                            await cover_resp.aclose()
 
-                return StreamingResponse(
-                    _cover_stream(), status_code=cover_resp.status_code, headers=cover_headers
-                )
+                    return StreamingResponse(
+                        _cover_stream(), status_code=cover_resp.status_code, headers=cover_headers
+                    )
+                await cover_resp.aclose()
+                # 官方返回非 200（如 404）时，尝试对本地选取的这首歌刮削封面
+                meta = official_track_meta_by_guid(cover_id) or official_track_meta_by_guid(picked_guid)
+                if meta and meta.get("title"):
+                    enriched = await _enrich_cover_via_netease(
+                        request, cover_id, {}, title=meta.get("title", ""), artist=meta.get("artist", "")
+                    )
+                    if enriched:
+                        return await _serve_image_bytes_or_redirect(enriched)
             # 每日推荐/热门推荐暂无曲目封面时，返回官方默认高清海报，避免客户端回退为灰底音符图标
             default_cov = (
                 "https://p1.music.126.net/0SUEG8yDACfx0Bw2MYFv4Q==/109951170048519512.jpg"
                 if playlist_kind == "hot"
                 else "https://p2.music.126.net/rIi7Qzy2i2Y_1QD7cd0MYA==/109951170048506929.jpg"
             )
-            return RedirectResponse(default_cov, status_code=302)
+            return await _serve_image_bytes_or_redirect(default_cov)
         guid = picked_guid
-    # 网易账号歌单封面：登记的封面直链直接 302（兼容重启后反查表未重建的裸假 id）
+    # 网易账号歌单封面：登记的封面直链直接输出图片流（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
         cover = nmpl.cover_url_for(nm_pl_id)
         if cover:
-            return RedirectResponse(cover, status_code=302)
+            return await _serve_image_bytes_or_redirect(cover)
         return Response(status_code=404)
     if not is_online_guid(guid):
         resp = await forward_to_upstream(request, get_upstream_client(request.app))
         if resp.status_code == 200:
             return resp
-        # 官方未生成封面（404/异常）时，尝试从本地落库文件的内嵌封面兜底
+        # 官方未生成封面（404/异常）时：
+        # 1. 优先尝试从本地落库文件的内嵌封面兜底
         embedded = _embedded_cover_bytes(guid)
         if embedded:
             art, mime = embedded
             return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+        # 2. 本地歌曲无内嵌封面：查 official_track_meta_by_guid 反查歌名、歌手，通过云端（网易云）刮削补全高清封面！
+        meta = official_track_meta_by_guid(guid)
+        if meta and meta.get("title"):
+            enriched_cov = await _enrich_cover_via_netease(
+                request, guid, {}, title=meta.get("title", ""), artist=meta.get("artist", "")
+            )
+            if enriched_cov:
+                return await _serve_image_bytes_or_redirect(enriched_cov)
         return resp
 
-    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
+    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接输出图片流
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
         cover = str((album_entry.get("item") or {}).get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
-            if cover.startswith("http://"):
-                cover = "https://" + cover[len("http://"):]
-            return RedirectResponse(cover, status_code=302)
+            return await _serve_image_bytes_or_redirect(cover)
         return _placeholder_cover_response(guid)
 
     # ① 优先读取本地已缓存/入库音频文件的内嵌专辑图（0ms 本地磁盘直出，不依赖网络上游，彻底杜绝外链防盗链与 Mixed Content）
@@ -6515,24 +6668,20 @@ async def static_cover(request: Request, subpath: str = ""):
     if cached_t:
         cov = _cover_url_of(cached_t)
         if cov and _KW_TEXT_COVER_HOST not in cov:
-            if cov.startswith("http://"):
-                cov = "https://" + cov[len("http://"):]
-            return RedirectResponse(cov, status_code=302)
+            return await _serve_image_bytes_or_redirect(cov)
 
     # ④ 尝试从历史/收藏快照或歌单缓存读取 cover_url（0ms 快速兜底）
     snap = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
     if snap:
         cov = _cover_url_of(snap)
         if cov and _KW_TEXT_COVER_HOST not in cov:
-            if cov.startswith("http://"):
-                cov = "https://" + cov[len("http://"):]
-            return RedirectResponse(cov, status_code=302)
+            return await _serve_image_bytes_or_redirect(cov)
 
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
-    # ⑤ 在线信息已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    # ⑤ 在线信息已知直链封面直接输出图片流；酷我文本封面除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
-        return RedirectResponse(cover, status_code=302)
+        return await _serve_image_bytes_or_redirect(cover)
 
     # ⑥ 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
     direct = ""
@@ -6542,12 +6691,19 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
-        return RedirectResponse(direct, status_code=302)
+        return await _serve_image_bytes_or_redirect(direct)
 
-    # ⑦ 网易 cloudsearch 同名曲补全
-    enriched = await _enrich_cover_via_netease(request, guid, data or {})
+    # ⑦ 网易 cloudsearch 同名曲补全（如 data 为空，优先从 snap/cached_t 补全歌名歌手）
+    snap_track = snap or cached_t or {}
+    enriched = await _enrich_cover_via_netease(
+        request,
+        guid,
+        data or {},
+        title=str(snap_track.get("title") or (data or {}).get("title") or ""),
+        artist=str(snap_track.get("artist") or (data or {}).get("artist") or ""),
+    )
     if enriched:
-        return RedirectResponse(enriched, status_code=302)
+        return await _serve_image_bytes_or_redirect(enriched)
 
     # ⑧ 本地占位图池：在线曲目封面永不 404
     return _placeholder_cover_response(guid)
