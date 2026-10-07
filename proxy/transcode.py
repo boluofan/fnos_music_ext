@@ -140,6 +140,7 @@ def playlist_text(sess: Session) -> str:
 def _ffmpeg_argv(src: str, headers: dict | None, sess: Session, directory: str) -> list[str]:
     argv = [FFMPEG_BIN or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if src.startswith(("http://", "https://")):
+        argv += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
         if headers:
             blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             argv += ["-headers", blob]
