@@ -7981,9 +7981,6 @@ async def playlist_list(request: Request):
             logger.warning("%s recommend list inject failed: %s", kind, e)
             continue
         tracks = bundle.get("tracks") or []
-        if kind == "hot" and not tracks:
-            # 热门歌单构建失败/无可用榜单时不挂空壳（每日推荐保留占位等待后台生成）
-            continue
         rec = _playlist_public_fields(bundle.get("playlist") or {}, tracks)
         rec["trackCount"] = len(tracks)
         recs.append(rec)

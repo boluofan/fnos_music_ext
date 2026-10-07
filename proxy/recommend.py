@@ -1726,6 +1726,38 @@ async def get_or_build_daily(
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
+    async def from_charts_fallback(on_track=None, should_stop=None) -> list[dict]:
+        """榜单兜底：当网易云未登录且 lx 自定义音源无可用榜单时，
+        直接从酷狗 TOP500 / 飙升榜获取热门歌曲（免登录公网直连）。
+        """
+        if not recommend_hot:
+            return []
+        try:
+            from . import charts as chart_mod
+        except ImportError:
+            import charts as chart_mod
+
+        day = today_key()
+        # 1. 优先读取已缓存的榜单（0ms 本地磁盘直出）
+        for cid in ("kg_8888", "kg_6666", "kg_23784"):
+            cached_tracks = chart_mod.load_chart_cache(cid, day)
+            if cached_tracks:
+                res = resolve_source_candidates(cached_tracks, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+                if res:
+                    return res
+
+        # 2. 无本地缓存时，通过 charts 模块直连抓取酷狗 TOP500 / 飙升榜
+        for cid in ("kg_8888", "kg_6666"):
+            try:
+                fetched = await chart_mod.get_or_load_chart_tracks(cid, limit=PLAYLIST_SIZE)
+                if fetched:
+                    res = resolve_source_candidates(fetched, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+                    if res:
+                        return res
+            except Exception as e:
+                logger.debug("from_charts_fallback for %s failed: %s", cid, e)
+        return []
+
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
         # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源
         # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
@@ -1877,6 +1909,8 @@ async def get_or_build_daily(
     if kind == "hot":
         await run_tier("netease-charts", from_netease_charts)
         await run_tier("lx-charts", from_lx_charts)
+        if len(tracks) < PLAYLIST_SIZE:
+            await run_tier("charts-fallback", from_charts_fallback)
     elif recommend_daily:
         if not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
